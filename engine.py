@@ -576,3 +576,57 @@ def read_file_text(path, limit=512_000):
         return text, size
     except (OSError, PermissionError):
         return None, 0
+
+
+# --------------------------------------------------------------------------- #
+#  Disk usage + folder sizes (read-only)
+# --------------------------------------------------------------------------- #
+import shutil  # noqa: E402  (kept local; only needed for disk usage)
+
+_FOLDER_SIZE_CACHE = {}
+
+
+def disk_info():
+    """Total / used / free for every mounted drive. Read-only."""
+    out = []
+    for d in list_drives():
+        try:
+            u = shutil.disk_usage(d)
+            out.append({
+                "drive": d,
+                "total": u.total, "used": u.used, "free": u.free,
+                "total_h": human_size(u.total),
+                "used_h": human_size(u.used),
+                "free_h": human_size(u.free),
+                "percent": round(u.used / u.total * 100, 1) if u.total else 0,
+            })
+        except (OSError, PermissionError, ValueError):
+            continue
+    return out
+
+
+def folder_size(path, ttl=120):
+    """
+    Recursive size + file count of a folder, cached for `ttl` seconds.
+    Read-only (os.walk + getsize). Used by the folder picker to show real sizes.
+    """
+    key = os.path.abspath(path)
+    now = time.time()
+    c = _FOLDER_SIZE_CACHE.get(key)
+    if c and now - c[1] < ttl:
+        return {"size": c[0], "files": c[2], "size_h": human_size(c[0]),
+                "cached": True}
+    total, nfiles = 0, 0
+    try:
+        for root, _dirs, files in os.walk(key):
+            for f in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, f))
+                    nfiles += 1
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    _FOLDER_SIZE_CACHE[key] = (total, now, nfiles)
+    return {"size": total, "files": nfiles, "size_h": human_size(total),
+            "cached": False}

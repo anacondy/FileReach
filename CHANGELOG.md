@@ -3,6 +3,28 @@
 All notable changes to FileReach are documented here.
 Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [v1.1.0] — 2026-06-30 — *Features & UX*
+
+### Fixed
+- **Critical UX bug:** typing an extension (e.g. `.md`) while a Type chip was active
+  returned zero results (extension + category were ANDed). An explicit extension now
+  overrides the type filter.
+- **Repeated searches:** typing/clicking no longer fires a burst of identical requests;
+  search is debounced (300 ms) with in-flight request deduplication.
+
+### Added
+- **Dark mode** — warm-charcoal theme that keeps the Linen palette; toggle in the top bar,
+  persists across sessions, respects OS `prefers-color-scheme` on first run.
+- **Idle disk overview** — the home screen now shows total/used/free capacity per drive.
+- **System folder picker (Browse)** — opens the native OS folder dialog (Chrome/Edge) and
+  runs an instant client-side search over the picked folder; no index needed. Falls back
+  to the in-app browser elsewhere.
+- **In-picker search** — filter folders by name while browsing.
+- **Folder sizes** — real recursive size + file count shown next to each folder (lazy, cached).
+- **Autofocus** — pressing any letter/digit/`.` focuses the search box; **Ctrl+K** too.
+- New endpoints: `/api/disk`, `/api/folder_sizes`.
+- **FEATURES.md** — a complete feature guide.
+
 ## [v1.0.1] — 2026-06-30 — *Security & packaging hotfix*
 
 Remediates the issues in the [Security Audit 2026-06-30](docs/SECURITY_AUDIT_2026-06-30.md).

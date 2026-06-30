@@ -42,6 +42,8 @@ typeface, soft shadows, and subtle 3D motion.
 
 ## ✨ Features
 
+See **[FEATURES.md](FEATURES.md)** for a full guide (every feature, what it does, how to use it). Quick overview:
+
 - **Paste several names at once** (one per line or comma-separated). Results are
   relevance-ranked; when there's no exact match, the **most related** files appear with a
   `% related` badge (fuzzy matching via `rapidfuzz`, stdlib `difflib` fallback).
@@ -71,11 +73,11 @@ typeface, soft shadows, and subtle 3D motion.
 
 ### Option A — Download a prebuilt binary (no Python needed)
 
-1. Go to the **[Releases page](../../releases)**.
-2. Download the build for your OS:
-   - **Windows:** `FileReach-Windows.zip`
-   - **macOS:** `FileReach-Mac.zip`
-   - **Linux:** `FileReach-Linux.zip`
+1. Go to the **[Releases page](../../releases/latest)**.
+2. Download the build for your OS (direct links):
+   - **Windows:** [`FileReach-Windows.zip`](../../releases/latest/download/FileReach-Windows.zip)
+   - **macOS:** [`FileReach-Mac.zip`](../../releases/latest/download/FileReach-Mac.zip)
+   - **Linux:** [`FileReach-Linux.zip`](../../releases/latest/download/FileReach-Linux.zip)
 3. Unzip and run:
    - **Windows:** double-click `FileReach.exe` (click **Yes** once on the permission prompt).
    - **macOS:** run `./FileReach` (see note below about Gatekeeper).

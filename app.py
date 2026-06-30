@@ -25,6 +25,7 @@ from engine import (
     Indexer, SearchEngine, list_drives, list_dirs, reveal_in_explorer,
     read_file_text, TYPE_CATEGORIES, TEXT_VIEWABLE, IMAGE_VIEWABLE,
     RENDERABLE_HTML, human_size, human_date, human_date_short, is_windows,
+    disk_info, folder_size,
 )
 
 PORT = int(os.environ.get("FILEREACH_PORT", "8765"))
@@ -405,6 +406,24 @@ def api_types():
         "images": sorted(IMAGE_VIEWABLE),
         "renderable": sorted(RENDERABLE_HTML),
     })
+
+
+@app.route("/api/disk")
+def api_disk():
+    """Drive capacity / used / free. Shown in the idle state."""
+    return jsonify({"disks": disk_info()})
+
+
+@app.route("/api/folder_sizes")
+def api_folder_sizes():
+    """Real recursive size for a set of folders (pipe-separated paths).
+    Used by the folder picker to show sizes next to each folder name."""
+    raw = request.args.get("paths", "")
+    paths = [p for p in raw.split("|") if p and os.path.isdir(p)]
+    out = {}
+    for p in paths:
+        out[p] = folder_size(p)
+    return jsonify(out)
 
 
 # --------------------------------------------------------------------------- #
