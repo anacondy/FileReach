@@ -3,6 +3,37 @@
 All notable changes to FileReach are documented here.
 Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [v1.4.0] — 2026-07-01 — *Performance + Security hardening (audit remediation)*
+
+### Performance (critical — from live logs)
+- **folder_sizes was taking up to 19 minutes** (1153s!) blocking the entire server.
+  Now: skips heavy dirs (.venv, node_modules, __pycache__, site-packages, build,
+  target, .git), time-boxed at 8s, deduped across concurrent calls.
+- **/api/search returned 400 on folder-only queries** — now returns 200 so the UI
+  falls back to live search cleanly (was causing spurious errors).
+- **live_search now includes matching directories** — searching "3 GAL" finds the
+  folder "3-GAL" itself, not just files inside it.
+- **Long-list lag** — render cap for smoother scrolling.
+
+### Security (from AUDIT_REPORT_v1.2.0.md — all findings addressed)
+- **C1 Markdown XSS:** `javascript:` and attribute-breakout in markdown links
+  eliminated — hrefs now scheme-whitelisted (http/https/mailto only).
+- **C2 HTML viewer XSS:** srcdoc attribute breakout eliminated — viewer now uses
+  a blob: URL (content stays isolated in the sandboxed iframe).
+- **H1 Same-origin prefix bypass:** replaced flawed `startswith` with strict
+  `urlparse().netloc` equality. `http://127.0.0.1:8765.evil.com` now blocked.
+- **H3 api_raw path traversal:** validates `os.path.isfile`, rejects symlinks,
+  uses `send_file` (no dynamic `send_from_directory`).
+- **CSP:** `Content-Security-Policy` header on all HTML responses — defense-in-depth
+  against any remaining injection vectors.
+- **L2:** removed dead `long_path()` function.
+- **L3:** added `idx_root` index (faster `is_indexed()` lookups).
+
+### Remaining (accepted / future)
+- CSRF token for state-changing requests (H2 deep fix) — deferred; same-origin guard
+  + CSP mitigate the primary vectors.
+- Rate limiting (M1) — deferred for a local single-user tool.
+
 ## [v1.3.0] — 2026-07-01 — *Token matching, path auto-scope, global folder search, scrollbars*
 
 ### Fixed

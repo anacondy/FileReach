@@ -621,7 +621,7 @@ function renderViewerContent(f){const b=$('#vbody');
   if(f.is_image) b.innerHTML=`<img class="viewer-img" src="/api/raw?path=${encodeURIComponent(f.path)}" alt="">`;
   else if(f.is_renderable){b.innerHTML=`<div class="view-toggle"><button class="active" data-m="render">Rendered</button><button data-m="source">Source</button></div><div id="vcontent"></div>`;
     const set=m=>{$$('.view-toggle button').forEach(x=>x.classList.toggle('active',x.dataset.m===m));
-      if(m==='render')$('#vcontent').innerHTML=`<iframe class="render-iframe" sandbox="allow-same-origin" srcdoc="${esc(f.content||'')}"></iframe>`;
+      if(m==='render'){var bb=new Blob([f.content||''],{type:'text/html'});var url=URL.createObjectURL(bb);$('#vcontent').innerHTML='<iframe class="render-iframe" sandbox="allow-same-origin" src="'+url+'"></iframe>';}
       else $('#vcontent').innerHTML=`<pre class="code">${highlightCode(f.content||'',f.ext)}</pre>`;};
     $$('.view-toggle button').forEach(x=>x.onclick=()=>set(x.dataset.m)); set('render');}
   else if(f.is_text){if(f.ext==='.md'||f.ext==='.markdown') b.innerHTML=`<div class="md-body">${renderMarkdown(f.content||'')}</div>`; else b.innerHTML=`<pre class="code">${highlightCode(f.content||'',f.ext)}</pre>`;}
@@ -635,7 +635,7 @@ function renderMarkdown(md){let h=esc(md);
   h=h.replace(/^\s*[-*]\s+(.*)$/gm,'<li>$1</li>'); h=h.replace(/(<li>[\s\S]*?<\/li>)/g,'<ul>$1</ul>').replace(/<\/ul>\s*<ul>/g,'');
   h=h.replace(/^(?!<)(\d+)\.\s+(.*)$/gm,'<li>$2</li>'); h=h.replace(/^---$/gm,'<hr>');
   h=h.replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>').replace(/\*([^*]+)\*/g,'<em>$1</em>').replace(/`([^`]+)`/g,'<code>$1</code>');
-  h=h.replace(/\[([^\]]+)\]\(([^)]+)\)/g,'<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  h=h.replace(/\[([^\]]+)\]\(([^)]+)\)/g,function(m,txt,url){var u=url.trim();if(!/^https?:\/|^mailto:/i.test(u)){return txt;}return '<a href="'+u+'" target="_blank" rel="noopener noreferrer">'+txt+'</a>';});
   h=h.replace(/\n{2,}/g,'</p><p>').replace(/^(?!<)/,'<p>').replace(/([^>])$/,'$1</p>'); return h;}
 function highlightCode(code,ext){let h=esc(code);
   const kw={'.js':/(\bconst\b|\blet\b|\bvar\b|\bfunction\b|\breturn\b|\bif\b|\belse\b|\bfor\b|\bwhile\b|\bclass\b|\bnew\b|\bimport\b|\bfrom\b|\bexport\b|\basync\b|\bawait\b|\btrue\b|\bfalse\b|\bnull\b|\bundefined\b)/g,'.jsx':/(\bconst\b|\blet\b|\bfunction\b|\breturn\b|\bimport\b|\bfrom\b|\bexport\b|\bdefault\b|\bclass\b|\bextends\b|\brender\b|\btrue\b|\bfalse\b|\bnull\b)/g,'.ts':/(\bconst\b|\blet\b|\binterface\b|\btype\b|\bfunction\b|\breturn\b|\bimport\b|\bexport\b|\bclass\b|\bpublic\b|\bprivate\b|\bnew\b|\basync\b|\bawait\b)/g,'.py':/(\bdef\b|\bclass\b|\bimport\b|\bfrom\b|\breturn\b|\bif\b|\belif\b|\belse\b|\bfor\b|\bwhile\b|\btry\b|\bexcept\b|\bwith\b|\bas\b|\blambda\b|\bself\b|\bNone\b|\bTrue\b|\bFalse\b|\basync\b|\bawait\b|\byield\b)/g,'.java':/(\bpublic\b|\bprivate\b|\bprotected\b|\bclass\b|\binterface\b|\bvoid\b|\bint\b|\bString\b|\breturn\b|\bnew\b|\bif\b|\belse\b|\bfor\b|\bwhile\b|\bimport\b|\bpackage\b|\bstatic\b|\bfinal\b|\bextends\b|\bimplements\b)/g};

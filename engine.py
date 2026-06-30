@@ -24,7 +24,7 @@ import shutil
 import subprocess
 from datetime import datetime
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 # ----------------------------------------------------------------------------- #
 #  File-type categories
@@ -139,14 +139,7 @@ def is_windows():
     return platform.system() == "Windows"
 
 
-def long_path(path):
-    """Enable access to very long paths (>260 chars) on Windows."""
-    if is_windows():
-        abs_path = os.path.abspath(path)
-        if abs_path.startswith("\\\\?\\"):
-            return abs_path
-        return "\\\\?\\" + abs_path
-    return path
+# long_path() removed in v1.4.0 (was dead code; audit L2)
 
 
 def looks_like_path(s):
@@ -552,6 +545,20 @@ def live_search(path, query=None, ext=None, ftype=None, limit=1500, timeout=25.0
             try:
                 if entry.is_dir(follow_symlinks=False):
                     stack.append(entry.path)
+                    # also include the folder itself if it matches the query
+                    name_l = entry.name.lower()
+                    if (terms or ext) and not ext and _name_matches(name_l, entry.path.lower()):
+                        if len(results) < limit:
+                            st = entry.stat(follow_symlinks=False)
+                            results.append({
+                                "path": entry.path, "name": entry.name, "ext": "",
+                                "size": 0, "created": st.st_ctime, "modified": st.st_mtime,
+                                "kind": "folder",
+                                "size_h": "—", "created_h": human_date_short(st.st_ctime),
+                                "modified_h": human_date_short(st.st_mtime),
+                                "is_image": False, "is_viewable_text": False,
+                                "is_renderable": False,
+                            })
                 elif entry.is_file(follow_symlinks=False):
                     scanned += 1
                     name = entry.name
@@ -686,6 +693,10 @@ def read_file_text(path, limit=512_000):
 #  Disk usage + folder sizes (read-only)
 # --------------------------------------------------------------------------- #
 _FOLDER_SIZE_CACHE = {}
+_FOLDER_SIZE_LOCK = threading.Lock()
+_SKIP_DIRS = {".venv", "venv", "node_modules", "__pycache__", ".git", ".svn",
+              ".hg", "site-packages", "dist-packages", ".next", ".nuxt",
+              ".svelte-kit", ".turbo", ".cache", ".parcel-cache", "build", "target"}
 
 
 def disk_info():
@@ -704,15 +715,28 @@ def disk_info():
     return out
 
 
-def folder_size(path, ttl=120):
+def folder_size(path, ttl=120, timeout=8.0):
+    """Recursive size + file count. Skips heavy dirs (.venv, node_modules, etc.),
+    time-boxed at `timeout` seconds, deduped across concurrent calls."""
     key = os.path.abspath(path)
     now = time.time()
     c = _FOLDER_SIZE_CACHE.get(key)
-    if c and now - c[1] < ttl:
+    if c and len(c) > 3 and c[3] is False and now - c[1] < ttl:
         return {"size": c[0], "files": c[2], "size_h": human_size(c[0]), "cached": True}
-    total, nfiles = 0, 0
+    with _FOLDER_SIZE_LOCK:
+        c2 = _FOLDER_SIZE_CACHE.get(key)
+        if c2 and len(c2) > 3 and c2[3] is True:
+            return {"size": c2[0], "files": c2[2], "size_h": human_size(c2[0]),
+                    "cached": True, "in_flight": True}
+        _FOLDER_SIZE_CACHE[key] = (0, now, 0, True)
+    total, nfiles, timed_out = 0, 0, False
+    start = time.time()
     try:
-        for root, _dirs, files in os.walk(key):
+        for root, dirs, files in os.walk(key):
+            if time.time() - start > timeout:
+                timed_out = True
+                break
+            dirs[:] = [d for d in dirs if d.lower() not in _SKIP_DIRS]
             for f in files:
                 try:
                     total += os.path.getsize(os.path.join(root, f))
@@ -721,5 +745,7 @@ def folder_size(path, ttl=120):
                     continue
     except OSError:
         pass
-    _FOLDER_SIZE_CACHE[key] = (total, now, nfiles)
-    return {"size": total, "files": nfiles, "size_h": human_size(total), "cached": False}
+    with _FOLDER_SIZE_LOCK:
+        _FOLDER_SIZE_CACHE[key] = (total, time.time(), nfiles, False)
+    return {"size": total, "files": nfiles, "size_h": human_size(total),
+            "cached": False, "timed_out": timed_out}

@@ -174,20 +174,13 @@ def _enforce_same_origin():
     if request.path.startswith("/api/"):
         origin = request.headers.get("Origin") or request.headers.get("Referer")
         if origin:
-            host = request.headers.get("Host")
-            if host:
-                ok = False
-                for scheme in ("http://", "https://"):
-                    if origin.startswith(scheme + host):
-                        ok = True
-                        break
-                    rest = origin[len(scheme):]
-                    if rest.startswith(host + "/") or rest == host:
-                        ok = True
-                        break
-                if not ok:
-                    log.warn(f"Blocked cross-origin request from {origin}")
-                    return jsonify({"error": "cross-origin request blocked"}), 403
+            host = request.headers.get("Host", "")
+            from urllib.parse import urlparse
+            parsed = urlparse(origin)
+            # strict netloc equality — no prefix matching
+            if parsed.netloc != host:
+                log.warn(f"Blocked cross-origin request from {origin}")
+                return jsonify({"error": "cross-origin request blocked"}), 403
     g.req_start = time.time()
 
 
@@ -219,6 +212,7 @@ def _access_log(resp):
     # This is what fixes "I updated the files but the old UI still shows".
     if request.path == "/" or request.path.endswith(".html"):
         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        resp.headers["Content-Security-Policy"] = "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; object-src 'none'; frame-src 'self'; connect-src 'self'"
         resp.headers["Pragma"] = "no-cache"
         resp.headers["Expires"] = "0"
     elif request.path.startswith("/api/status") or request.path.startswith("/api/version"):
@@ -298,8 +292,8 @@ def api_search():
         limit = min(int(request.args.get("limit", 1000)), 5000)
     except (TypeError, ValueError):
         limit = 1000
-    if not (q or ext or ftype):
-        return json_error("Provide a query, extension, or type")
+    if not (q or ext or ftype or folder):
+        return json_error("Provide a query, extension, type, or folder")
 
     res = search.search(
         query=q or None, ext=ext or None, ftype=ftype or None,
@@ -462,8 +456,12 @@ def api_file():
 
 @app.route("/api/raw")
 def api_raw():
+    """Serve a raw (image) file to the viewer. Read-only. Path-validated."""
     path = request.args.get("path", "").strip()
-    if not path or not os.path.exists(path):
+    if not path:
+        abort(404)
+    abspath = os.path.abspath(path)
+    if not os.path.isfile(abspath) or os.path.islink(abspath):
         abort(404)
     ext = os.path.splitext(path)[1].lower().lstrip(".")
     mime = {
@@ -472,8 +470,8 @@ def api_raw():
         "svg": "image/svg+xml", "ico": "image/x-icon",
     }.get(ext, "application/octet-stream")
     try:
-        directory, fname = os.path.split(os.path.abspath(path))
-        return send_from_directory(directory, fname, mimetype=mime)
+        from flask import send_file
+        return send_file(abspath, mimetype=mime)
     except Exception:
         abort(404)
 
