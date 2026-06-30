@@ -4,24 +4,22 @@ FileReach — Flask API server + static UI host.
 Run with:  python app.py
 Then open: http://127.0.0.1:8765
 
-All endpoints are READ-ONLY with respect to your files. The only thing this app
-writes is its own index database (in %LOCALAPPDATA%/FileReach) and a small log.
+Security posture:
+  * READ-ONLY with respect to your files (opens 'rb'/'r' only).
+  * Binds to 127.0.0.1 only (never exposed to the network).
+  * Same-Origin enforcement: cross-origin requests (CSRF / drive-by) are rejected.
+  * The only writes are this app's own index DB + log in the user data dir.
 """
 
 import os
 import sys
 import io
 import re
-import json
-import time
 import platform
 import threading
 from datetime import datetime
-from functools import wraps
 
-from flask import (
-    Flask, request, jsonify, send_from_directory, abort, Response,
-)
+from flask import Flask, request, jsonify, send_from_directory, abort
 
 from engine import (
     Indexer, SearchEngine, list_drives, list_dirs, reveal_in_explorer,
@@ -29,11 +27,18 @@ from engine import (
     RENDERABLE_HTML, human_size, human_date, human_date_short, is_windows,
 )
 
+PORT = int(os.environ.get("FILEREACH_PORT", "8765"))
+
 # --------------------------------------------------------------------------- #
-#  Paths
+#  Paths — frozen-aware so PyInstaller builds locate the bundled UI.
+#  When frozen, bundled resources (static/) live under sys._MEIPASS; all our
+#  *writable* data stays in the user data dir, never next to the binary.
 # --------------------------------------------------------------------------- #
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-STATIC_DIR = os.path.join(APP_DIR, "static")
+if getattr(sys, "frozen", False):
+    BUNDLE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+else:
+    BUNDLE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = os.path.join(BUNDLE_DIR, "static")
 
 if is_windows():
     _base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
@@ -54,7 +59,6 @@ OCR = {"available": False, "pytesseract": None, "path": None}
 def init_ocr():
     try:
         import pytesseract  # type: ignore
-        # Common Windows install locations
         candidates = []
         if is_windows():
             pf = os.environ.get("ProgramFiles", r"C:\Program Files")
@@ -65,14 +69,10 @@ def init_ocr():
                     exe = os.path.join(tdir, "tesseract.exe")
                     if os.path.isfile(exe):
                         candidates.append(exe)
-        chosen = None
-        for c in candidates:
-            chosen = c
-            break
+        chosen = candidates[0] if candidates else None
         if chosen:
             pytesseract.pytesseract.tesseract_cmd = chosen
-        # probe
-        pytesseract.get_tesseract_version()
+        pytesseract.get_tesseract_version()  # probe
         OCR.update({"available": True, "pytesseract": pytesseract, "path": chosen})
         log(f"OCR ready (Tesseract {pytesseract.get_tesseract_version()})")
     except Exception as e:
@@ -94,7 +94,7 @@ def log(msg):
 # --------------------------------------------------------------------------- #
 app = Flask(__name__, static_folder=None)
 app.config["JSON_SORT_KEYS"] = False
-app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024  # 32MB upload cap for OCR images
+app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024  # 32MB upload cap (OCR)
 
 indexer = Indexer(DB_PATH)
 indexer.connect()
@@ -103,6 +103,31 @@ search = SearchEngine(indexer.conn)
 
 def json_error(msg, code=400):
     return jsonify({"error": msg}), code
+
+
+# --------------------------------------------------------------------------- #
+#  Same-Origin enforcement — blocks CSRF / drive-by requests from other sites.
+#  Browsers send `Origin` (or `Referer`) on cross-origin calls; if it is present
+#  and does not match our own Host, we reject. Requests with no Origin header
+#  (direct navigation, cURL, the app itself) are allowed through.
+# --------------------------------------------------------------------------- #
+@app.before_request
+def _enforce_same_origin():
+    origin = request.headers.get("Origin") or request.headers.get("Referer")
+    if not origin:
+        return None
+    host = request.headers.get("Host")
+    if not host:
+        return None
+    for scheme in ("http://", "https://"):
+        if origin.startswith(scheme + host):
+            return None
+        # Referer may carry a path after the host
+        rest = origin[len(scheme):]
+        if rest.startswith(host + "/") or rest == host:
+            return None
+    log(f"Blocked cross-origin request from {origin}")
+    return jsonify({"error": "cross-origin request blocked"}), 403
 
 
 # --------------------------------------------------------------------------- #
@@ -119,18 +144,17 @@ def api_status():
     st["ocr_available"] = OCR["available"]
     st["ocr_path"] = OCR["path"]
     st["platform"] = platform.system()
-    st["indexed_roots"] = indexer.search_roots() if hasattr(indexer, "search_roots") else []
-    st["indexed_roots"] = [
-        r for r in indexer.conn.execute(
-            "SELECT root, COUNT(*) n FROM files GROUP BY root ORDER BY root"
-        ).fetchall()
-    ]
-    st["indexed_roots"] = [dict(r) for r in st["indexed_roots"]]
+    rows = indexer.conn.execute(
+        "SELECT root, COUNT(*) n FROM files GROUP BY root ORDER BY root"
+    ).fetchall()
+    st["indexed_roots"] = [dict(r) for r in rows]
     return jsonify(st)
 
 
 @app.route("/api/index", methods=["POST"])
 def api_index():
+    if indexer.is_busy():
+        return json_error("Already indexing — cancel the current run first", 409)
     data = request.get_json(silent=True) or {}
     root = (data.get("root") or "").strip()
     incremental = data.get("incremental", True)
@@ -138,7 +162,7 @@ def api_index():
         return json_error("Missing 'root' path")
     if not os.path.exists(root):
         return json_error(f"Path not found: {root}")
-    ok = indexer.index(root, incremental=incremental)
+    ok = indexer.index(root, incremental=bool(incremental))
     return jsonify({"started": ok, "status": indexer.get_status()})
 
 
@@ -155,7 +179,10 @@ def api_search():
     ftype = request.args.get("type", "").strip().lower()
     folder = request.args.get("folder", "").strip()
     sort = request.args.get("sort", "relevance")
-    limit = min(int(request.args.get("limit", 1000)), 5000)
+    try:
+        limit = min(int(request.args.get("limit", 1000)), 5000)
+    except (TypeError, ValueError):
+        limit = 1000
     include_folders = request.args.get("folders") in ("1", "true", "yes")
 
     if not (q or ext or ftype or include_folders):
@@ -164,8 +191,8 @@ def api_search():
     res = search.search(
         query=q or None, ext=ext or None, ftype=ftype or None,
         folder=folder or None, sort=sort, limit=limit,
+        include_folders=include_folders,
     )
-    # enrich
     for r in res["results"]:
         r["size_h"] = human_size(r["size"])
         r["created_h"] = human_date_short(r["created"])
@@ -203,7 +230,6 @@ def api_browse():
     dirs, real = list_dirs(path)
     parent = ""
     if real and real not in ("/", ""):
-        # parent of a drive root on windows stays the drive
         p = os.path.dirname(real)
         if p and p != real:
             parent = p
@@ -294,17 +320,22 @@ def api_ocr():
         return json_error("No images uploaded")
 
     from PIL import Image  # type: ignore
+    # Pillow guards against decompression bombs by default (MAX_IMAGE_PIXELS);
+    # keep that protection on and surface bombs as a clean error.
+    Image.MAX_IMAGE_PIXELS = max(Image.MAX_IMAGE_PIXELS or 0, 89_000_000)
     pytesseract = OCR["pytesseract"]
 
-    full_text = []
-    pages = []
+    full_text, pages = [], []
     for f in files:
         try:
             f.stream.seek(0)
             img = Image.open(io.BytesIO(f.read()))
+            img.load()  # force decode now so bombs raise here, not in tesseract
             text = pytesseract.image_to_string(img)
+        except Image.DecompressionBombError:
+            pages.append({"name": f.filename, "error": "image too large (bomb guard)"})
+            continue
         except Exception as e:
-            text = ""
             pages.append({"name": f.filename, "error": str(e)})
             continue
         text = text.strip()
@@ -312,12 +343,11 @@ def api_ocr():
         pages.append({"name": f.filename, "text": text})
 
     combined = "\n\n".join(t for t in full_text if t).strip()
-    suggestions = extract_search_hints(combined)
     return jsonify({
         "available": True,
         "text": combined,
         "pages": pages,
-        "suggestions": suggestions,
+        "suggestions": extract_search_hints(combined),
     })
 
 
@@ -329,24 +359,21 @@ def extract_search_hints(text):
     if not text:
         return {"names": [], "extensions": [], "dates": [], "queries": []}
 
-    # extensions like .pdf / .mp4 / .docx
+    all_ext_sets = list(TYPE_CATEGORIES.values())
     exts = sorted(set(re.findall(r"\.([a-zA-Z0-9]{2,5})\b", text.lower())))
-    exts = [e for e in exts if any(e in s for s in TYPE_CATEGORIES) or e in
-            ("pdf", "txt", "md", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "csv",
-             "mp3", "mp4", "mkv", "zip", "rar", "7z", "exe", "psd", "ai")]
+    exts = [e for e in exts
+            if any(("." + e) in s for s in all_ext_sets)
+            or e in ("pdf", "txt", "md", "doc", "docx", "xls", "xlsx",
+                     "ppt", "pptx", "csv", "mp3", "mp4", "mkv", "zip",
+                     "rar", "7z", "exe", "psd", "ai")]
 
-    # dates: 2023-04-18, 18/04/2023, 04-18-2023, 18.04.2023
     date_pats = [
         r"\b(\d{4}-\d{1,2}-\d{1,2})\b",
         r"\b(\d{1,2}[/.]\d{1,2}[/.]\d{2,4})\b",
         r"\b(\d{1,2}-\d{1,2}-\d{2,4})\b",
     ]
-    dates = []
-    for p in date_pats:
-        dates.extend(re.findall(p, text))
-    dates = sorted(set(dates))
+    dates = sorted({d for p in date_pats for d in re.findall(p, text)})
 
-    # candidate file-name tokens: words 3+ chars that look like identifiers
     tokens = re.findall(r"[A-Za-z][A-Za-z0-9_\-]{2,}", text)
     stop = {
         "the", "and", "for", "with", "this", "that", "from", "have", "your",
@@ -360,15 +387,13 @@ def extract_search_hints(text):
         if t.lower() in stop:
             continue
         counts[t.lower()] = counts.get(t.lower(), 0) + 1
-    # favour longer / repeated tokens
-    names = sorted(counts.keys(), key=lambda k: (counts[k], len(k)), reverse=True)[:8]
+    names = sorted(counts, key=lambda k: (counts[k], len(k)), reverse=True)[:8]
 
-    queries = list(names[:5])
     return {
         "names": names,
         "extensions": ["." + e for e in exts],
         "dates": dates,
-        "queries": queries,
+        "queries": list(names[:5]),
     }
 
 
@@ -388,21 +413,19 @@ def api_types():
 def main():
     init_ocr()
     log("FileReach starting")
-    port = int(os.environ.get("FILEREACH_PORT", "8765"))
     print("\n" + "=" * 60)
     print("  FileReach is running.")
     print("  Open this URL in your browser:")
-    print(f"    ->  http://127.0.0.1:{port}")
+    print(f"    ->  http://127.0.0.1:{PORT}")
     print("  Keep this window open while you search.")
     print("  Press Ctrl+C to stop.")
     print("=" * 60 + "\n")
-    # auto-open the browser
     try:
         import webbrowser
-        threading.Timer(1.2, lambda: webbrowser.open(f"http://127.0.0.1:{port}")).start()
+        threading.Timer(1.2, lambda: webbrowser.open(f"http://127.0.0.1:{PORT}")).start()
     except Exception:
         pass
-    app.run(host="127.0.0.1", port=port, debug=False, threaded=True)
+    app.run(host="127.0.0.1", port=PORT, debug=False, threaded=True)
 
 
 if __name__ == "__main__":

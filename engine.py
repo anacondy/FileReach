@@ -1,20 +1,19 @@
 """
 FileReach engine — read-only filesystem indexer + search.
 
-Design rules (from the user):
-  * NEVER delete any file.        -> we never call os.remove / shutil.rmtree.
-  * NEVER duplicate any file.     -> we never copy file bytes; we only read metadata/content.
-  * Read-only access everywhere.  -> files opened with mode 'rb' / 'r' only.
-  * As fast as possible.          -> os.scandir walk + SQLite (WAL) index, indexed columns,
-                                     in-memory fuzzy scoring, background incremental re-index.
+Design rules:
+  * NEVER delete any file.    -> no os.remove / shutil.rmtree anywhere.
+  * NEVER duplicate any file. -> file bytes are never copied; only metadata/content read.
+  * Read-only access.         -> files opened with mode 'rb' / 'r' only.
+  * As fast as possible.      -> os.scandir walk + SQLite (WAL) index, indexed columns,
+                                 in-memory fuzzy scoring, background incremental re-index.
 
-This module has zero external dependencies for core search. `rapidfuzz` is optional
-(faster fuzzy matching); `difflib` is the stdlib fallback.
+Core search has zero external dependencies. `rapidfuzz` is optional (faster fuzzy
+matching); `difflib` is the stdlib fallback.
 """
 
 import os
 import re
-import sys
 import math
 import time
 import sqlite3
@@ -25,6 +24,12 @@ from datetime import datetime
 
 # ----------------------------------------------------------------------------- #
 #  File-type categories
+#
+#  NOTE on overlap: "spreadsheets" and "presentations" intentionally overlap with
+#  "documents". They exist so the UI type-chips can filter (.xls/.csv/etc.) and
+#  report stats; _kind_for() classifies a file by the FIRST matching category
+#  (documents), so the `kind` column holds {images,videos,audio,documents,code,
+#  archives,fonts,other,folder}. This is by design, not a bug.
 # ----------------------------------------------------------------------------- #
 TYPE_CATEGORIES = {
     "images": {
@@ -178,6 +183,9 @@ class Indexer:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA temp_store=MEMORY")
+        # Wait (up to 6s) for the lock instead of raising "database is locked"
+        # when the indexer thread is writing and a search reads concurrently.
+        self.conn.execute("PRAGMA busy_timeout=6000")
         self._init_schema()
         return self.conn
 
@@ -215,6 +223,10 @@ class Indexer:
         return "other"
 
     # ----- status -----
+    def is_busy(self):
+        with self.lock:
+            return self.status["state"] == "indexing"
+
     def get_status(self):
         with self.lock:
             d = dict(self.status)
@@ -300,8 +312,7 @@ class Indexer:
 
         def _run():
             try:
-                # For incremental mode we mark then delete stale records of this root.
-                # We INSERT OR REPLACE so a re-index updates sizes/dates in place.
+                # INSERT OR REPLACE so a re-index updates sizes/dates in place.
                 BATCH = 5000
                 buf = []
                 with self.conn:  # transaction
@@ -352,10 +363,10 @@ class SearchEngine:
 
     # ----- low-level query builder -----
     def _build(self, query=None, ext=None, ftype=None, folder=None, folders_only=False):
-        where = ["is_dir = 0"] if not folders_only else ["is_dir = 1"]
+        where = ["is_dir = 1"] if folders_only else ["is_dir = 0"]
         params = []
 
-        if folders_only is False and ext:
+        if not folders_only and ext:
             e = ext.strip().lower()
             if not e.startswith("."):
                 e = "." + e
@@ -390,8 +401,10 @@ class SearchEngine:
 
     # ----- search -----
     def search(self, query=None, ext=None, ftype=None, folder=None,
-               sort="relevance", limit=1000):
-        where, params, name_terms = self._build(query, ext, ftype, folder)
+               sort="relevance", limit=1000, include_folders=False):
+        where, params, name_terms = self._build(
+            query, ext, ftype, folder, folders_only=bool(include_folders)
+        )
         order = self._order_for(sort, has_query=bool(name_terms))
 
         sql = (f"SELECT path,name,ext,size,created,modified,kind FROM files "
@@ -449,7 +462,6 @@ class SearchEngine:
     # ----- aggregate stats for an extension or type -----
     def stats(self, ext=None, ftype=None, folder=None):
         where, params, _ = self._build(ext=ext, ftype=ftype, folder=folder)
-        base = f"FROM files WHERE {where}"
         row = self.conn.execute(
             f"SELECT COUNT(*) n, COALESCE(SUM(size),0) s, "
             f"MIN(created) mn, MAX(created) mx FROM files WHERE {where}",
@@ -518,7 +530,7 @@ def list_dirs(path):
     """List immediate sub-directories of `path` for the folder picker."""
     if not path or path in ("/", ""):
         if is_windows():
-            return [{"name": d, "path": d} for d in list_drives()]
+            return [{"name": d, "path": d} for d in list_drives()], ""
         path = "/"
     try:
         out = []
@@ -539,7 +551,6 @@ def reveal_in_explorer(path):
     """Open the OS file manager with `path` selected. Read-only, no writes."""
     path = os.path.abspath(path)
     if is_windows():
-        # explorer /select, "C:\path\to\file.ext"
         subprocess.Popen(["explorer", "/select,", path])
         return True
     if platform.system() == "Darwin":
@@ -563,5 +574,5 @@ def read_file_text(path, limit=512_000):
             except Exception:
                 text = data.decode("utf-8", errors="replace")
         return text, size
-    except (OSError, PermissionError) as e:
+    except (OSError, PermissionError):
         return None, 0

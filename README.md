@@ -182,6 +182,17 @@ small log. The server binds to `127.0.0.1` only — nothing leaves your machine.
 
 ---
 
+## 🔒 Security
+
+FileReach is local-first and read-only by construction. See the full
+**[Security Audit 2026-06-30](docs/SECURITY_AUDIT_2026-06-30.md)** for the findings,
+fixes, and residual-risk assessment. Highlights:
+
+- Binds to `127.0.0.1` only — never exposed to the network.
+- Same-Origin enforcement blocks CSRF / drive-by requests from other sites.
+- All SQL is parameterized (no injection surface); files opened `'rb'`/`'r'` only.
+- No delete / no duplicate / no move calls exist anywhere in the source.
+
 ## 🤝 Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Keep the four hard rules sacred: read-only, no
