@@ -10,17 +10,32 @@ For install/build steps, see the [README](README.md). For security posture, see 
 
 | Feature | What it does | How to use |
 |---|---|---|
-| **Name search** | Matches file/folder names anywhere in the path (case-insensitive). Fuzzy-ranked by relevance. | Type a name and press **Enter**. Paste **several** at once (one per line or comma). |
-| **Extension search** | Finds every file of an extension; shows **count**, **total size**, **first** and **last** created of that type. | Type the extension: `.pdf`, `.mp4`, `.psd`… |
-| **Type chips** | One-click filters: Images, Videos, Audio, Documents, Code, Archives. | Click a chip. Click again to clear. |
-| **Extension overrides type** | If you type `.md` while a type chip is on, the extension wins (no more empty results from conflicting filters). | Just type the extension — it works. |
-| **Relevance / fuzzy** | When there's no exact match, the most-related files appear with a `% related` badge (uses `rapidfuzz`). | Automatic. |
-| **Folder scope** | Restrict a search to one folder (must be indexed, or under an indexed root). | Click **Folder** → browse → **Search this folder only**. |
-| **Debounced search** | Rapid typing/clicks collapse into a single request (stops the repeated calls). | Automatic — 300 ms after you stop. |
+| **Name search** | Matches file/folder names anywhere (case-insensitive), fuzzy-ranked. | Type a name, press **Enter**. Paste several at once. |
+| **Paste a path** | Searches a host folder directly — **works even if it's not indexed.** | Paste e.g. `C:\Users\iassh\OneDrive\Documents` (optionally followed by a query). |
+| **Live fallback** | If a scoped folder isn't indexed, FileReach walks it live so you still get results. | Automatic. |
+| **Extension search** | All files of an extension; shows count, total size, first/last created. Not "typed" — it overrides the type chip. | Type `.pdf`, `.mp4`… |
+| **Type chips** | Filter by category. When an extension is typed, the chip is ignored and each result shows its category tag instead. | Click a chip. |
+| **Folder scope** | Restrict to one folder. | **Folder** → browse → pick, or paste the path. |
+| **Debounced** | Rapid typing collapses into one request. | Automatic (300 ms). |
 
 ### Sorting
-Best match · Name A→Z / Z→A · Newest/oldest modified · Newest/oldest created · Largest/smallest.
-Change from the **Sort** dropdown.
+Best match · Name A→Z / Z→A · Newest/oldest modified or created · Largest/smallest.
+
+---
+
+## Logs & feedback (read the terminal — no screenshots needed)
+
+When you run FileReach, the terminal/console shows:
+
+- A **version banner** (version, platform, Python, data folder, log path, OCR status).
+- A coloured line per action, e.g. `LIVE search: C:\Users\... q='3'` →
+  `Live search done: 3 hits, scanned 4 in 0.0s`.
+- `WARN` when a scope isn't indexed (so you know why results may be live), and when a
+  cross-origin request is blocked.
+- `ERROR` with a traceback on failures.
+
+Everything is also written to `%LOCALAPPDATA%\FileReach\filereach.log`
+(macOS/Linux: `~/.filereach/filereach.log`). Open it with any text editor.
 
 ---
 

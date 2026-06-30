@@ -184,6 +184,20 @@ small log. The server binds to `127.0.0.1` only — nothing leaves your machine.
 
 ---
 
+## 🩺 Logs & troubleshooting (read the terminal)
+
+When you launch FileReach, the console prints everything you need — **no screenshots
+required**. You'll see:
+
+- A **version banner**: version, platform, Python, data folder, log path, OCR status.
+- One coloured line per action: what was searched, **how many hits**, and elapsed time.
+- `WARN` when a folder you searched isn't indexed (so you know results came from a live
+  walk), and when cross-origin requests are blocked.
+- `ERROR` with a traceback if something fails.
+
+All of it is mirrored to `%LOCALAPPDATA%\FileReach\filereach.log`
+(`~/.filereach/filereach.log`). Paste-path searches work even without an index.
+
 ## 🔒 Security
 
 FileReach is local-first and read-only by construction. See the full

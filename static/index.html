@@ -448,29 +448,79 @@ async function renderIdle(s){
   </div>`;
 }
 
-/* ---------- search (debounced + ext-vs-type fix) ---------- */
+/* ---------- search (debounced, path-aware, live fallback) ---------- */
 function getQuery(){return $('#searchInput').value.trim();}
 function detectExt(q){
   const t=q.replace(/^\./,'').toLowerCase();
   if(/^[a-z0-9]{1,5}$/.test(t)&&q.includes('.')&&!q.includes(' ')&&q.length<=6) return t;
   return null;
 }
+function looksLikePath(s){
+  if(!s) return false;
+  s=s.trim().replace(/^["']|["']$/g,'');
+  if(/^[A-Za-z]:[\\/]/.test(s)) return true;        // C:\... or C:/...
+  if(s.startsWith("\\\\")) return true;             // UNC \\server\share
+  if(s.startsWith("/")||s.startsWith("~/")||s==='/') return true;
+  return false;
+}
+// Parse a query that may embed a host path, e.g. "C:\Users\iassh\OneDrive\Documents"
+// or "C:\Users\iassh\Documents report". Returns {folder, nameQuery}.
+function parseQuery(raw){
+  let folder=null, nameQuery=raw;
+  const firstTok=raw.split(/\s+/)[0];
+  if(looksLikePath(firstTok)){
+    folder=firstTok.replace(/^["']|["']$/g,'');
+    nameQuery=raw.slice(firstTok.length).trim();
+  } else if(looksLikePath(raw)){
+    folder=raw.replace(/^["']|["']$/g,'');
+    nameQuery='';
+  }
+  return {folder, nameQuery};
+}
 const runSearch=debounce(doSearch,300);
 function doSearch(){
-  const q=getQuery(), sort=$('#sortSelect').value;
-  const ext=detectExt(q);
-  // FIX: an explicit extension overrides the type chip (md + Code → just .md).
-  const sendType = ext? null : activeType;
-  if(!q && !activeType){toast('Type a name, pick a type, or use an extension like “.mp4”');return;}
+  const raw=getQuery(), sort=$('#sortSelect').value;
+  const ext=detectExt(raw);
+  const parsed=parseQuery(raw);
+  const sendType=ext? null : activeType;            // ext overrides type chip
+  // Effective folder: explicit scope wins, else a path pasted into the query.
+  const folder = scopeFolder || parsed.folder;
+  const nameQuery = parsed.folder ? parsed.nameQuery : (ext? '' : raw);
+
+  if(!raw && !activeType){toast('Type a name, paste a path (e.g. C:\\Users\\you\\Docs), or use an extension');return;}
+
   const myReq=++lastReq;
   hasSearched=true;
   $('#resultsArea').dataset.filled='1';
-  $('#resultsArea').innerHTML=loadingBox('Searching your storage…');
+  $('#resultsArea').innerHTML=loadingBox(folder? ('Scanning '+folder+' …') : 'Searching your storage…');
   $('#statsBanner').style.display='none';
-  API('/api/search?'+new URLSearchParams({q:ext?'':q, ext:ext||'', type:sendType||'', folder:scopeFolder||'', sort, limit:1500}))
-  .then(d=>{ if(myReq!==lastReq)return; currentResults=d.results; renderResults(d, ext);
-    if(ext||sendType) return API('/api/stats?'+new URLSearchParams({ext:ext||'',type:sendType||'',folder:scopeFolder||''})).then(st=>renderStats(st, ext||sendType));
-  }).catch(err=>{ if(myReq!==lastReq)return; $('#resultsArea').innerHTML=infoBox('⚠️ '+(err.error||'Search failed'),'Index a drive/folder first (Re-index), or your filter may be too narrow. If you searched a folder, make sure that folder (or its parent) was indexed.');});
+
+  API('/api/search?'+new URLSearchParams({q:nameQuery, ext:ext||'', type:sendType||'', folder:folder||'', sort, limit:1500}))
+  .then(d=>{
+    if(myReq!==lastReq)return;
+    // Fallback: folder is set, index has 0 hits, and that folder is NOT indexed
+    // -> walk it live so the user always gets results (the "shows nothing" fix).
+    if(folder && d.count===0 && d.scope_indexed===false){
+      $('#resultsArea').innerHTML=loadingBox('Not indexed — live-scanning '+folder+' …');
+      return API('/api/live_search?'+new URLSearchParams({path:folder, q:nameQuery, ext:ext||'', type:sendType||'', limit:1500}))
+        .then(ld=>{ if(myReq!==lastReq)return; currentResults=ld.results; renderResults(ld, ext, folder, ld); });
+    }
+    currentResults=d.results; renderResults(d, ext, folder);
+    if((ext||sendType) && d.count>0){
+      return API('/api/stats?'+new URLSearchParams({ext:ext||'',type:sendType||'',folder:scopeFolder||''})).then(st=>renderStats(st, ext||sendType));
+    }
+  }).catch(err=>{
+    if(myReq!==lastReq)return;
+    // If the index search errored but we have a folder, still try live.
+    if(folder){
+      $('#resultsArea').innerHTML=loadingBox('Live-scanning '+folder+' …');
+      API('/api/live_search?'+new URLSearchParams({path:folder, q:nameQuery, ext:ext||'', type:sendType||'', limit:1500}))
+        .then(ld=>{ if(myReq!==lastReq)return; currentResults=ld.results; renderResults(ld, ext, folder, ld); })
+        .catch(e2=>{ if(myReq!==lastReq)return; $('#resultsArea').innerHTML=infoBox('⚠️ '+(e2.error||e2),'Could not read <b>'+esc(folder)+'</b>. The server console shows the exact error.');});
+      return;
+    }
+    $('#resultsArea').innerHTML=infoBox('⚠️ '+(err.error||'Search failed'),'Index a drive/folder first (Re-index), or paste a path to search it directly. Watch the server console for the exact error.');
+  });
 }
 function renderStats(st,label){
   const b=$('#statsBanner'); b.style.display='grid';
@@ -479,12 +529,23 @@ function renderStats(st,label){
     <div class="stat-card"><span class="label">First created</span><span class="value sm">${esc(st.first_created_h)}</span></div>
     <div class="stat-card"><span class="label">Last created</span><span class="value sm">${esc(st.last_created_h)}</span></div>`;
 }
-function renderResults(d, ext){
+function renderResults(d, ext, folder, live){
   const area=$('#resultsArea');
   if(!d.results.length){
-    area.innerHTML=infoBox('No exact match found','Try a shorter name, a different spelling, or an extension (e.g. <b>.pdf</b>). If you scoped to a folder, make sure that folder was indexed.',true);return;
+    const scopeNote = folder ? ` in <b>${esc(folder)}</b>` : '';
+    area.innerHTML=infoBox('No matches'+scopeNote,
+      'Genuinely nothing matched that name'+scopeNote+'. Check spelling, or try an extension like <b>.pdf</b>. ' +
+      (folder? 'The server console will confirm the scan finished.' : ''),true);return;
   }
-  let html=`<div class="results-head"><h2>Results <span class="count">· ${d.count.toLocaleString()} shown</span></h2><span class="count">${d.fuzzy_used?'Relevance-ranked (fuzzy)':'Sorted'}</span></div><div class="result-list">`;
+  let srcLabel;
+  if(live){
+    srcLabel = `Live scan · ${d.scanned? d.scanned.toLocaleString()+' scanned · ':''}${d.elapsed||'?'}s`;
+    if(live.timed_out) srcLabel += ' · ⚠ partial (timed out)';
+    else if(live.truncated) srcLabel += ' · (capped at limit)';
+  } else {
+    srcLabel = d.fuzzy_used?'Relevance-ranked (fuzzy) · index':'Index';
+  }
+  let html=`<div class="results-head"><h2>Results <span class="count">· ${d.count.toLocaleString()} shown${folder? ' in '+esc(folder):''}</span></h2><span class="count">${esc(srcLabel)}</span></div><div class="result-list">`;
   d.results.forEach((r,i)=>{
     const k=r.kind||'other';
     const score=r._score!=null&&r._score<100?`<span class="match-badge">${Math.round(r._score)}% related</span>`:'';
@@ -670,6 +731,22 @@ function init(){
 
   $('#pickClose').onclick=()=>$('#pickerOverlay').classList.remove('show');
   $('#pickFilter').addEventListener('input',paintPickGrid);
+  // Paste a path in the picker's search bar → jump to it (Enter) or live-search it.
+  $('#pickFilter').addEventListener('keydown',e=>{
+    if(e.key==='Enter'){
+      const v=e.target.value.trim();
+      if(!v)return;
+      if(looksLikePath(v)){
+        // Navigate the picker into the pasted folder.
+        e.preventDefault(); browse(v.replace(/^["']|["']$/g,''));
+        e.target.value='';
+      } else {
+        // Not a path → scope to the current folder and run a name search.
+        e.preventDefault();
+        if(pickerCurrent){ chooseFolder(pickerCurrent); $('#searchInput').value=v; doSearch(); }
+      }
+    }
+  });
   $('#viewerOverlay').addEventListener('mousedown',e=>{if(e.target.id==='viewerOverlay')$('#viewerOverlay').classList.remove('show');});
   $('#pickerOverlay').addEventListener('mousedown',e=>{if(e.target.id==='pickerOverlay')$('#pickerOverlay').classList.remove('show');});
 

@@ -3,6 +3,31 @@
 All notable changes to FileReach are documented here.
 Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [v1.2.0] — 2026-06-30 — *Logging, live search & path paste*
+
+This release targets "the app shows nothing" reports: the root cause was folders that
+weren't indexed. Searching them now works **without an index**, via a live filesystem
+walk. Every action is also logged to the console so you can see exactly what happened.
+
+### Fixed
+- **"Won't show anything" bug:** if a scoped folder isn't under an indexed root, the
+  search now **auto-falls back to a live walk** of that folder and returns real matches.
+  (Previously returned 0 because the folder simply wasn't indexed.)
+- Extension + type-chip conflict no longer silently empties results (extension wins).
+
+### Added
+- **Structured logging** — a version banner on startup, and a concise coloured line for
+  every search/index/OCR/reveal with elapsed time and hit counts. Mirrored to the log
+  file (`%LOCALAPPDATA%\FileReach\filereach.log`). You can read what happened / what
+  failed straight from the terminal — no need to screenshot.
+- **Path paste in the search bar** — paste `C:\Users\iassh\OneDrive\Documents` (with or
+  without a trailing query) to search that folder directly. Also works in the folder
+  picker's search bar (Enter to jump in).
+- **Live (no-index) search** — new `/api/live_search`, time-boxed (25s) and capped.
+- **Version + status** — new `/api/version`; status shows version, platform, log path.
+- Extension searches are not "classified" as a type; results show their category tag so
+  you can see where files fall.
+
 ## [v1.1.0] — 2026-06-30 — *Features & UX*
 
 ### Fixed
