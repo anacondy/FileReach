@@ -1,0 +1,25 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# FileReach runtime data (never commit indexes/logs)
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# Build output
+build/
+dist/
+*.spec.bak
+
+# Generated icons (built from assets/icon.png via make_icon.py)
+assets/icon.ico
+assets/icon.icns
+
+# OS clutter
+.DS_Store
+Thumbs.db
+desktop.ini

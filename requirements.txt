@@ -1,0 +1,11 @@
+# FileReach dependencies
+# Core (required)
+Flask>=3.0
+Pillow>=10.0
+
+# Optional — faster fuzzy matching. If absent, FileReach falls back to difflib.
+rapidfuzz>=3.0
+
+# Optional — OCR (image -> text). Also needs the Tesseract engine installed.
+# Get it (one-time): https://github.com/UB-Mannheim/tesseract/wiki
+pytesseract>=0.3.10

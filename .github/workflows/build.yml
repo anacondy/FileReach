@@ -1,0 +1,78 @@
+name: Build & Release
+
+# Builds standalone FileReach packages for Windows, macOS and Linux using
+# PyInstaller, then attaches them to a GitHub Release (when a tag is pushed).
+# Manual runs (workflow_dispatch) build the artifacts and let you download them
+# from the Actions run page — useful for testing without making a release.
+
+on:
+  push:
+    tags:
+      - "v*"            # e.g.  git tag v1.0.0  &&  git push origin v1.0.0
+  workflow_dispatch:    # Run manually from the Actions tab
+
+permissions:
+  contents: write       # required to create releases & upload assets
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset: FileReach-Windows.zip
+          - os: macos-latest
+            asset: FileReach-Mac.zip
+          - os: ubuntu-latest
+            asset: FileReach-Linux.zip
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Generate icons
+        run: python make_icon.py
+
+      - name: Build with PyInstaller
+        run: pyinstaller filereach.spec --noconfirm
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (Test-Path ${{ matrix.asset }}) { Remove-Item ${{ matrix.asset }} }
+          Compress-Archive -Path dist/FileReach/* -DestinationPath ${{ matrix.asset }}
+
+      - name: Package (macOS / Linux)
+        if: runner.os != 'Windows'
+        run: |
+          cd dist
+          zip -r ../${{ matrix.asset }} FileReach
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          retention-days: 30
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset }}
+          generate_release_notes: true
