@@ -32,7 +32,7 @@ from engine import (
     Indexer, SearchEngine, list_drives, list_dirs, reveal_in_explorer,
     read_file_text, TYPE_CATEGORIES, TEXT_VIEWABLE, IMAGE_VIEWABLE,
     RENDERABLE_HTML, human_size, human_date, human_date_short, is_windows,
-    disk_info, folder_size, live_search, looks_like_path, VERSION,
+    disk_info, folder_size, live_search, looks_like_path, find_folders, VERSION,
 )
 
 PORT = int(os.environ.get("FILEREACH_PORT", "8765"))
@@ -387,6 +387,35 @@ def api_browse():
         if p and p != real:
             parent = p
     return jsonify({"current": real, "parent": parent, "dirs": dirs})
+
+
+@app.route("/api/find_folders")
+def api_find_folders():
+    """Global folder search across ALL indexed roots (so you can find a folder
+    by name regardless of where you're browsing)."""
+    q = request.args.get("q", "").strip()
+    if not q:
+        return jsonify({"folders": [], "indexed": search.count_all() > 0})
+    folders = find_folders(indexer.conn, q)
+    return jsonify({"folders": folders, "count": len(folders),
+                    "indexed": search.count_all() > 0})
+
+
+@app.route("/api/resolve_path")
+def api_resolve_path():
+    """Tell the UI whether a pasted path is a folder or a file (or doesn't exist)."""
+    path = request.args.get("path", "").strip().strip('"').strip("'")
+    if not path:
+        return jsonify({"exists": False})
+    abspath = os.path.abspath(path)
+    if os.path.isdir(abspath):
+        return jsonify({"exists": True, "is_dir": True, "is_file": False,
+                        "path": abspath, "name": os.path.basename(abspath)})
+    if os.path.isfile(abspath):
+        return jsonify({"exists": True, "is_dir": False, "is_file": True,
+                        "path": abspath, "parent": os.path.dirname(abspath),
+                        "name": os.path.basename(abspath)})
+    return jsonify({"exists": False, "path": abspath})
 
 
 @app.route("/api/reveal", methods=["POST"])

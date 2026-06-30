@@ -24,7 +24,7 @@ import shutil
 import subprocess
 from datetime import datetime
 
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 
 # ----------------------------------------------------------------------------- #
 #  File-type categories
@@ -354,16 +354,21 @@ class Indexer:
 #  Relevance ranking (shared by index search + live search)
 # ----------------------------------------------------------------------------- #
 def rank_results(results, terms):
-    """Score each result by best fuzzy match against query terms; sort desc."""
-    joined = " ".join(terms).lower()
+    """Score each result by best fuzzy match against query terms; sort desc.
+    Tokenises terms so '3 GAL' ranks '3-GAL' highly."""
+    all_toks = []
+    for g in terms:
+        all_toks.extend([t for t in re.split(r"[\s\-_]+", g.lower()) if t])
+    joined = " ".join(all_toks)
     for r in results:
         name_l = r["name"].lower()
         base = _score(joined, name_l)
         best_term = 0.0
-        for t in terms:
-            tl = t.lower()
-            if tl in name_l:
-                best_term = max(best_term, 95.0 if name_l.startswith(tl) else 80.0)
+        for t in all_toks:
+            if t in name_l:
+                best_term = max(best_term, 95.0 if name_l.startswith(t) else 80.0)
+        if all_toks and all(t in name_l for t in all_toks):
+            best_term = max(best_term, 92.0)  # all tokens present -> strong match
         r["_score"] = round(max(base, best_term), 1)
     results.sort(key=lambda r: (-r["_score"], r["name"].lower()))
     return results
@@ -394,17 +399,26 @@ class SearchEngine:
             f = os.path.abspath(folder).replace("\\", "/")
             where.append("(replace(path,'\\','/') = ? OR replace(path,'\\','/') LIKE ?)")
             params.extend([f, f.rstrip("/") + "/%"])
+        # name query: groups (newline/comma/semicolon) are OR'd;
+        # within a group, tokens (space/dash/underscore) are AND'd.
+        # So "3 GAL" matches "3-GAL" and "3_GAL", and "report, notes"
+        # matches either name.
         name_terms = []
         if query:
-            parts = re.split(r"[\n,;]+", query)
-            name_terms = [p.strip() for p in parts if p.strip()]
+            groups = re.split(r"[\n,;]+", query)
+            name_terms = [g.strip() for g in groups if g.strip()]
         if name_terms:
             ors = []
-            for t in name_terms:
-                tl = t.lower()
-                ors.append("(name_lower LIKE ? OR path LIKE ?)")
-                params.extend([f"%{tl}%", f"%{tl}%"])
-            where.append("(" + " OR ".join(ors) + ")")
+            for g in name_terms:
+                toks = [t for t in re.split(r"[\s\-_]+", g.lower()) if t]
+                if not toks:
+                    continue
+                ands = " AND ".join("(name_lower LIKE ? OR path LIKE ?)" for _ in toks)
+                for t in toks:
+                    params.extend([f"%{t}%", f"%{t}%"])
+                ors.append(f"({ands})")
+            if ors:
+                where.append("(" + " OR ".join(ors) + ")")
         return " AND ".join(where), params, name_terms
 
     def search(self, query=None, ext=None, ftype=None, folder=None,
@@ -499,6 +513,18 @@ def live_search(path, query=None, ext=None, ftype=None, limit=1500, timeout=25.0
         if not ext.startswith("."):
             ext = "." + ext
     allowed_exts = TYPE_CATEGORIES[ftype] if (ftype and ftype in TYPE_CATEGORIES) else None
+    # tokenise groups: OR across groups, AND within (so "3 GAL" -> 3-GAL)
+    groups = []
+    for g in terms:
+        groups.append([t for t in re.split(r"[\s\-_]+", g) if t])
+
+    def _name_matches(name_l, path_l):
+        if not groups:
+            return True
+        for toks in groups:
+            if all(t in name_l or t in path_l for t in toks):
+                return True
+        return False
 
     results = []
     scanned = 0
@@ -535,7 +561,7 @@ def live_search(path, query=None, ext=None, ftype=None, limit=1500, timeout=25.0
                         continue
                     if allowed_exts is not None and e not in allowed_exts:
                         continue
-                    if terms and not any(t in name_l or t in entry.path.lower() for t in terms):
+                    if not _name_matches(name_l, entry.path.lower()):
                         continue
                     st = entry.stat(follow_symlinks=False)
                     results.append({
@@ -569,6 +595,27 @@ def _kind_for_static(ext):
         if ext in exts:
             return kind
     return "other"
+
+
+# --------------------------------------------------------------------------- #
+#  Find folders by name across the whole index (global folder search)
+# --------------------------------------------------------------------------- #
+def find_folders(conn, query, limit=200):
+    q = (query or "").strip().lower()
+    if not q:
+        return []
+    toks = [t for t in re.split(r"[\s\-_]+", q) if t]
+    where_parts = ["is_dir = 1"]
+    params = []
+    for t in toks:
+        where_parts.append("name_lower LIKE ?")
+        params.append(f"%{t}%")
+    where = " AND ".join(where_parts)
+    rows = conn.execute(
+        f"SELECT path, name FROM files WHERE {where} "
+        f"ORDER BY LENGTH(name) ASC LIMIT ?", params + [int(limit)]
+    ).fetchall()
+    return [{"path": r["path"], "name": r["name"]} for r in rows]
 
 
 # --------------------------------------------------------------------------- #

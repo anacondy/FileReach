@@ -3,6 +3,25 @@
 All notable changes to FileReach are documented here.
 Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [v1.3.0] — 2026-07-01 — *Token matching, path auto-scope, global folder search, scrollbars*
+
+### Fixed
+- **"3 GAL" didn't match "3-GAL":** search now tokenises on spaces, dashes, and
+  underscores — so "3 GAL" finds "3-GAL", "3_GAL", or "3 gal". Works in both
+  index and live search.
+- **White scrollbar in dark mode:** scrollbars are now themed with CSS variables
+  (thin, rounded, adapt to light/dark automatically).
+- **Long-list lag:** results rendering is capped for smoother scrolling.
+
+### Added
+- **Paste a path → auto-scope:** pasting a folder path (e.g.
+  C:\Users\iassh\PycharmProjects\3-Germany baby) in the search bar now auto-sets
+  it as the search scope and clears the input so you can search within it. Pasting
+  a file path scopes to its parent folder and searches for that file's name.
+- **Global folder search in the picker:** typing in the folder picker's search bar
+  now finds matching folders across all indexed drives (not just current location).
+- New endpoints: /api/resolve_path, /api/find_folders.
+
 ## [v1.2.1] — 2026-06-30 — *Dark-mode fix (browser cache) + version badge*
 
 ### Fixed

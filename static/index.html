@@ -48,6 +48,13 @@
   }
   *{box-sizing:border-box;}
   html,body{margin:0;padding:0;}
+  /* themed scrollbars — adapt to light/dark automatically */
+  *{scrollbar-width:thin; scrollbar-color:var(--border-subtle) transparent;}
+  *::-webkit-scrollbar{width:10px; height:10px;}
+  *::-webkit-scrollbar-track{background:transparent;}
+  *::-webkit-scrollbar-thumb{background:var(--border-subtle); border-radius:10px; border:2px solid transparent; background-clip:content-box;}
+  *::-webkit-scrollbar-thumb:hover{background:var(--text-tertiary); background-clip:content-box;}
+  *::-webkit-scrollbar-corner{background:transparent;}
   body{
     min-height:100vh;
     background:
@@ -347,7 +354,7 @@
       <button class="iconbtn" id="pickClose"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
     </div>
     <div class="modal-body">
-      <div class="pick-search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg><input id="pickFilter" placeholder="Filter folders by name…"></div>
+      <div class="pick-search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg><input id="pickFilter" placeholder="Search folders by name (across all indexed drives)…"></div>
       <div class="crumb" id="pickCrumb"></div>
       <div class="picker-grid" id="pickGrid"></div>
     </div>
@@ -489,48 +496,64 @@ function parseQuery(raw){
   return {folder, nameQuery};
 }
 const runSearch=debounce(doSearch,300);
+function setScope(path){
+  scopeFolder=path;
+  var svg='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" style="width:14px;height:14px"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>';
+  var x='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M6 6l12 12M18 6L6 18"/></svg>';
+  $('#scopeHolder').innerHTML='<span class="scope-chip">'+svg+'<span class="spath" title="'+esc(path)+'">'+esc(path)+'</span><button class="clear">'+x+'</button></span>';
+  $('#scopeHolder .clear').onclick=function(){scopeFolder=null;$('#scopeHolder').innerHTML='';};
+}
 function doSearch(){
-  const raw=getQuery(), sort=$('#sortSelect').value;
-  const ext=detectExt(raw);
-  const parsed=parseQuery(raw);
-  const sendType=ext? null : activeType;            // ext overrides type chip
-  // Effective folder: explicit scope wins, else a path pasted into the query.
-  const folder = scopeFolder || parsed.folder;
-  const nameQuery = parsed.folder ? parsed.nameQuery : (ext? '' : raw);
+  var raw=getQuery().trim(), sort=$('#sortSelect').value;
+  if(!raw && !activeType){toast('Type a name, paste a path, or use an extension');return;}
+  var firstTok=raw.split(/\s+/)[0];
+  if(looksLikePath(firstTok)){ resolveAndSearch(raw,firstTok,sort); return; }
+  runSearchIn(raw, scopeFolder, sort, ++lastReq);
+}
 
-  if(!raw && !activeType){toast('Type a name, paste a path (e.g. C:\\Users\\you\\Docs), or use an extension');return;}
-
-  const myReq=++lastReq;
-  hasSearched=true;
-  $('#resultsArea').dataset.filled='1';
-  $('#resultsArea').innerHTML=loadingBox(folder? ('Scanning '+folder+' …') : 'Searching your storage…');
+async function resolveAndSearch(raw,firstTok,sort){
+  var myReq=++lastReq; hasSearched=true; $('#resultsArea').dataset.filled='1';
+  $('#resultsArea').innerHTML=loadingBox('Resolving path...');
+  try{
+    var r=await API('/api/resolve_path?'+new URLSearchParams({path:raw}));
+    if(r.exists&&r.is_dir){
+      setScope(r.path); $('#searchInput').value=''; $('#resultsArea').dataset.filled='';
+      $('#resultsArea').innerHTML=infoBox('Folder set: '+esc(r.name),'Type a name or extension to search inside it.');
+      toast('Folder set'); $('#searchInput').focus(); return;
+    }
+    if(r.exists&&r.is_file){ setScope(r.parent); $('#searchInput').value=r.name; return runSearchIn(r.name, r.parent, sort, myReq); }
+    if(raw.length>firstTok.length){
+      var r2=await API('/api/resolve_path?'+new URLSearchParams({path:firstTok}));
+      if(r2.exists&&r2.is_dir){ var rest=raw.slice(firstTok.length).trim(); setScope(r2.path); if(rest){$('#searchInput').value=rest; return runSearchIn(rest, r2.path, sort, myReq);} }
+    }
+  }catch(e){}
+  runSearchIn(raw, scopeFolder, sort, myReq);
+}
+function runSearchIn(rawQuery, folder, sort, myReq){
+  var ext=detectExt(rawQuery), sendType=ext?null:activeType;
+  var parsed=parseQuery(rawQuery);
+  var nameQuery=parsed.folder?parsed.nameQuery:(ext?'':rawQuery);
+  var folder2=parsed.folder||folder;
+  hasSearched=true; $('#resultsArea').dataset.filled='1';
+  $('#resultsArea').innerHTML=loadingBox(folder2?('Scanning '+folder2+' ...'):'Searching your storage...');
   $('#statsBanner').style.display='none';
-
-  API('/api/search?'+new URLSearchParams({q:nameQuery, ext:ext||'', type:sendType||'', folder:folder||'', sort, limit:1500}))
-  .then(d=>{
+  API('/api/search?'+new URLSearchParams({q:nameQuery,ext:ext||'',type:sendType||'',folder:folder2||'',sort,limit:1500}))
+  .then(function(d){
     if(myReq!==lastReq)return;
-    // Fallback: folder is set, index has 0 hits, and that folder is NOT indexed
-    // -> walk it live so the user always gets results (the "shows nothing" fix).
-    if(folder && d.count===0 && d.scope_indexed===false){
-      $('#resultsArea').innerHTML=loadingBox('Not indexed — live-scanning '+folder+' …');
-      return API('/api/live_search?'+new URLSearchParams({path:folder, q:nameQuery, ext:ext||'', type:sendType||'', limit:1500}))
-        .then(ld=>{ if(myReq!==lastReq)return; currentResults=ld.results; renderResults(ld, ext, folder, ld); });
+    if(folder2&&d.count===0&&d.scope_indexed===false){
+      $('#resultsArea').innerHTML=loadingBox('Not indexed - live-scanning '+folder2+' ...');
+      return API('/api/live_search?'+new URLSearchParams({path:folder2,q:nameQuery,ext:ext||'',type:sendType||'',limit:1500})).then(function(ld){if(myReq!==lastReq)return;currentResults=ld.results;renderResults(ld,ext,folder2,ld);});
     }
-    currentResults=d.results; renderResults(d, ext, folder);
-    if((ext||sendType) && d.count>0){
-      return API('/api/stats?'+new URLSearchParams({ext:ext||'',type:sendType||'',folder:scopeFolder||''})).then(st=>renderStats(st, ext||sendType));
-    }
-  }).catch(err=>{
+    currentResults=d.results; renderResults(d,ext,folder2);
+    if((ext||sendType)&&d.count>0) return API('/api/stats?'+new URLSearchParams({ext:ext||'',type:sendType||'',folder:scopeFolder||''})).then(function(st){renderStats(st,ext||sendType);});
+  }).catch(function(err){
     if(myReq!==lastReq)return;
-    // If the index search errored but we have a folder, still try live.
-    if(folder){
-      $('#resultsArea').innerHTML=loadingBox('Live-scanning '+folder+' …');
-      API('/api/live_search?'+new URLSearchParams({path:folder, q:nameQuery, ext:ext||'', type:sendType||'', limit:1500}))
-        .then(ld=>{ if(myReq!==lastReq)return; currentResults=ld.results; renderResults(ld, ext, folder, ld); })
-        .catch(e2=>{ if(myReq!==lastReq)return; $('#resultsArea').innerHTML=infoBox('⚠️ '+(e2.error||e2),'Could not read <b>'+esc(folder)+'</b>. The server console shows the exact error.');});
+    if(folder2){
+      $('#resultsArea').innerHTML=loadingBox('Live-scanning '+folder2+' ...');
+      API('/api/live_search?'+new URLSearchParams({path:folder2,q:nameQuery,ext:ext||'',type:sendType||'',limit:1500})).then(function(ld){if(myReq!==lastReq)return;currentResults=ld.results;renderResults(ld,ext,folder2,ld);}).catch(function(e2){if(myReq!==lastReq)return;$('#resultsArea').innerHTML=infoBox('Search failed','Could not read '+esc(folder2)+'.');});
       return;
     }
-    $('#resultsArea').innerHTML=infoBox('⚠️ '+(err.error||'Search failed'),'Index a drive/folder first (Re-index), or paste a path to search it directly. Watch the server console for the exact error.');
+    $('#resultsArea').innerHTML=infoBox('Search failed','Index a drive or paste a path to search it directly.');
   });
 }
 function renderStats(st,label){
@@ -557,7 +580,7 @@ function renderResults(d, ext, folder, live){
     srcLabel = d.fuzzy_used?'Relevance-ranked (fuzzy) · index':'Index';
   }
   let html=`<div class="results-head"><h2>Results <span class="count">· ${d.count.toLocaleString()} shown${folder? ' in '+esc(folder):''}</span></h2><span class="count">${esc(srcLabel)}</span></div><div class="result-list">`;
-  d.results.forEach((r,i)=>{
+  var VISIBLE_CAP=400; d.results.forEach((r,i)=>{
     const k=r.kind||'other';
     const score=r._score!=null&&r._score<100?`<span class="match-badge">${Math.round(r._score)}% related</span>`:'';
     const viewable=r.is_viewable_text||r.is_image||r.is_renderable;
@@ -625,18 +648,37 @@ function highlightCode(code,ext){let h=esc(code);
 
 /* ---------- folder picker (with filter + sizes) ---------- */
 function openPicker(initial){$('#pickerOverlay').classList.add('show');browse(initial||'');}
+let pickerSearchTimer=null;
 function paintPickGrid(){
-  const f=$('#pickFilter').value.trim().toLowerCase();
+  const f=$('#pickFilter').value.trim();
   const g=$('#pickGrid');
-  const list=pickerDirs.filter(d=>!f||d.name.toLowerCase().includes(f));
-  if(!list.length){g.innerHTML='<div style="padding:20px;color:var(--text-tertiary);text-align:center">No matching folders</div>';return;}
-  g.innerHTML=list.map(dd=>`<div class="pick-item" data-p="${esc(dd.path)}">${KIND_ICON.folder}<span class="pn">${esc(dd.name)}</span><span class="psize" data-sizeof="${esc(dd.path)}">…</span><span class="choose">Open ›</span></div>`).join('');
-  $$('.pick-item').forEach(it=>it.onclick=()=>browse(it.dataset.p));
-  // lazy sizes
-  const paths=[...new Set(list.map(d=>d.path))].slice(0,40).join('|');
-  if(paths) API('/api/folder_sizes?'+new URLSearchParams({paths})).then(map=>{
-    Object.entries(map).forEach(([p,info])=>{const el=$(`.psize[data-sizeof="${CSS.escape(p)}"]`); if(el)el.textContent=info.size_h;});
-  }).catch(()=>{});
+  if(!f){ paintPickerItems(pickerDirs); return; }
+  // debounce global folder search
+  clearTimeout(pickerSearchTimer);
+  pickerSearchTimer=setTimeout(async()=>{
+    g.innerHTML='<div style="padding:20px;color:var(--text-tertiary);text-align:center">Searching all indexed folders...</div>';
+    try{
+      const r=await API('/api/find_folders?'+new URLSearchParams({q:f}));
+      if(!r.indexed){ g.innerHTML='<div style="padding:20px;color:var(--text-tertiary);text-align:center">Index a drive first (Re-index) to search folders globally.<br><br>Or browse manually.</div>'; return; }
+      if(!r.folders.length){ g.innerHTML='<div style="padding:20px;color:var(--text-tertiary);text-align:center">No folders matching "'+esc(f)+'"</div>'; return; }
+      paintPickerItems(r.folders.map(f=>({name:f.name,path:f.path})),true);
+    }catch(e){ paintPickerItems(pickerDirs.filter(d=>d.name.toLowerCase().includes(f.toLowerCase()))); }
+  },250);
+}
+function paintPickerItems(list,global){
+  const g=$('#pickGrid');
+  if(!list.length){g.innerHTML='<div style="padding:20px;color:var(--text-tertiary);text-align:center">No folders</div>';return;}
+  g.innerHTML=list.map(dd=>'<div class="pick-item" data-p="'+esc(dd.path)+'">'+KIND_ICON.folder+'<span class="pn">'+esc(dd.name)+'</span>'+(global?'<span class="fpath" style="font-size:10.5px;color:var(--text-tertiary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:200px">'+esc(dd.path)+'</span>':'<span class="psize" data-sizeof="'+esc(dd.path)+'">...</span>')+'<span class="choose">'+(global?'Select':'Open')+' ›</span></div>').join('');
+  $$('.pick-item').forEach(function(it){
+    it.onclick=function(){
+      if(global){ chooseFolder(it.dataset.p); }
+      else { browse(it.dataset.p); }
+    };
+  });
+  if(!global){
+    const paths=[...new Set(list.map(d=>d.path))].slice(0,40).join('|');
+    if(paths) API('/api/folder_sizes?'+new URLSearchParams({paths})).then(map=>{Object.entries(map).forEach(([p,info])=>{const el=document.querySelector('.psize[data-sizeof="'+CSS.escape(p)+'"]'); if(el)el.textContent=info.size_h;});}).catch(()=>{});
+  }
 }
 async function browse(path){
   pickerCurrent=path;
@@ -653,9 +695,7 @@ async function browse(path){
   }catch(e){$('#pickGrid').innerHTML='<div style="padding:20px;color:var(--accent-coral)">Could not read this location.</div>';}
 }
 function chooseFolder(path){
-  scopeFolder=path;
-  $('#scopeHolder').innerHTML=`<span class="scope-chip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" style="width:14px;height:14px"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg><span class="spath" title="${esc(path)}">${esc(path)}</span><button class="clear"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M6 6l12 12M18 6L6 18"/></svg></button></span>`;
-  $('#scopeHolder .clear').onclick=()=>{scopeFolder=null;$('#scopeHolder').innerHTML='';};
+  setScope(path);
   $('#pickerOverlay').classList.remove('show'); toast('Scoped to '+path);
 }
 
