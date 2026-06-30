@@ -24,7 +24,7 @@ import shutil
 import subprocess
 from datetime import datetime
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 
 # ----------------------------------------------------------------------------- #
 #  File-type categories

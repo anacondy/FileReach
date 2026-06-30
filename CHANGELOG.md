@@ -3,6 +3,19 @@
 All notable changes to FileReach are documented here.
 Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [v1.2.1] — 2026-06-30 — *Dark-mode fix (browser cache) + version badge*
+
+### Fixed
+- **Dark mode "not working":** the toggle JS + CSS were correct all along — the real
+  cause was the browser serving a **stale cached `index.html`** after an update. Added
+  `Cache-Control: no-store` headers so the browser always loads the fresh UI.
+
+### Added
+- **Version badge** in the top bar (e.g. `v1.2.1`) so you can confirm at a glance which
+  build is actually running (also via `/api/version`).
+- `Alt+T` keyboard shortcut to toggle dark mode.
+- Refactored theme toggle into a single `toggleTheme()` shared by the button + shortcut.
+
 ## [v1.2.0] — 2026-06-30 — *Logging, live search & path paste*
 
 This release targets "the app shows nothing" reports: the root cause was folders that

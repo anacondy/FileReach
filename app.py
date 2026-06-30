@@ -196,7 +196,6 @@ def _access_log(resp):
     try:
         if request.path.startswith("/api/") and request.method == "GET":
             ms = int((time.time() - getattr(g, "req_start", time.time())) * 1000)
-            # concise request line
             q = request.args.get("q")
             ext = request.args.get("ext")
             ftype = request.args.get("type")
@@ -207,7 +206,6 @@ def _access_log(resp):
             if ftype: parts.append(f"type={ftype}")
             if folder: parts.append(f"folder={folder}")
             detail = (" " + " ".join(parts)) if parts else ""
-            # body is JSON; pull count if present for search/live endpoints
             count = ""
             try:
                 if request.path in ("/api/search", "/api/live_search") and resp.is_json:
@@ -217,6 +215,14 @@ def _access_log(resp):
             log.dim(f"{request.method} {request.path}{detail} {resp.status_code} {ms}ms{count}")
     except Exception:
         pass
+    # ---- Cache-busting: never let the browser serve a stale UI ----
+    # This is what fixes "I updated the files but the old UI still shows".
+    if request.path == "/" or request.path.endswith(".html"):
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
+    elif request.path.startswith("/api/status") or request.path.startswith("/api/version"):
+        resp.headers["Cache-Control"] = "no-store"
     return resp
 
 
