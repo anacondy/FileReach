@@ -1,0 +1,3081 @@
+﻿
+=== FILE: .github\workflows\build.yml ===
+name: Build & Release
+
+# Builds standalone FileReach packages for Windows, macOS and Linux using
+# PyInstaller, then attaches them to a GitHub Release (when a tag is pushed).
+# Manual runs (workflow_dispatch) build the artifacts and let you download them
+# from the Actions run page — useful for testing without making a release.
+
+on:
+  push:
+    tags:
+      - "v*"            # e.g.  git tag v1.0.0  &&  git push origin v1.0.0
+  workflow_dispatch:    # Run manually from the Actions tab
+
+permissions:
+  contents: write       # required to create releases & upload assets
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset: FileReach-Windows.zip
+          - os: macos-latest
+            asset: FileReach-Mac.zip
+          - os: ubuntu-latest
+            asset: FileReach-Linux.zip
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Generate icons
+        run: python make_icon.py
+
+      - name: Build with PyInstaller
+        run: pyinstaller filereach.spec --noconfirm
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (Test-Path ${{ matrix.asset }}) { Remove-Item ${{ matrix.asset }} }
+          Compress-Archive -Path dist/FileReach/* -DestinationPath ${{ matrix.asset }}
+
+      - name: Package (macOS / Linux)
+        if: runner.os != 'Windows'
+        run: |
+          cd dist
+          zip -r ../${{ matrix.asset }} FileReach
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          retention-days: 30
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset }}
+          generate_release_notes: true
+
+
+
+=== FILE: docs\SECURITY_AUDIT_2026-06-30.md ===
+# FileReach — Security & Robustness Audit
+
+**Report date:** 2026-06-30
+**Scope:** `app.py`, `engine.py`, `static/index.html`, `run.py`, `filereach.spec`, `.github/workflows/build.yml`, `start.bat`
+**Audited release:** `v1.0.0` (commit `003cd3a`)
+**Status:** Findings triaged; **Critical / High issues remediated in this pass** (pending push as `v1.0.1`).
+
+---
+
+## 1. Executive summary
+
+FileReach is a **local-only, read-only file search tool**. The threat model is correspondingly narrow: it binds to `127.0.0.1`, opens files with `'rb'`/`'r'` only, and writes nothing but its own index DB and log. The four product guarantees — **no deletes, no duplicates, read-only, single permission** — hold up under review: there is no destructive call anywhere in the source, and all SQL is parameterized (**no injection surface**).
+
+That said, the `v1.0.0` commit shipped with one **Critical** packaging defect (broken frozen-path resolution → fragile/non-working packaged binaries) and several **High/Medium** hardening gaps (no CSRF protection on the localhost API, a shared SQLite connection across writer/reader threads, an unguarded `int()` cast, and dead code in `api_status`). These are fixed in this pass. Residual risk is low and documented in §7.
+
+**Severity counts:** Critical 1 · High 2 · Medium 4 · Low 6.
+
+---
+
+## 2. Methodology
+
+- Static review of all source + the PyInstaller spec and CI workflow.
+- `pyflakes` for unused symbols / dead variables.
+- Manual taint tracing of every user-reachable input (`query`, `path`, `ext`, `limit`, `folder`, OCR upload) to its sink (SQL, filesystem, subprocess).
+- Automated integration tests against a live Flask test client (CSRF same/cross-origin, malformed input, concurrency guard, folder search).
+
+---
+
+## 3. Critical findings
+
+### 🔴 C1 — Frozen-path resolution absent (broken packaged binaries)
+**Where:** `app.py` (Paths section) in `v1.0.0`.
+**Problem:** The committed file resolved `STATIC_DIR` purely from `__file__`:
+
+```python
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = os.path.join(APP_DIR, "static")
+```
+
+`__file__` is unreliable inside a PyInstaller bundle. In **onefile** mode the UI is never found (blank page / 404 on `/`). In **onefolder** mode it works *by luck* because `_MEIPASS` happens to equal the dist dir. The CI workflow (`build.yml`) is publishing Windows/macOS/Linux zips built from exactly this code, so the v1.0.0 release is at best fragile and at worst non-functional for end users who download the binary.
+**Fix applied:** Added explicit frozen detection — `sys._MEIPASS` when `getattr(sys, "frozen", False)`, else source dir. Bundled resources now resolve correctly in all build modes.
+
+---
+
+## 4. High findings
+
+### 🟠 H1 — No CSRF / cross-origin protection on the localhost API
+**Where:** `app.py` (all routes), `v1.0.0`.
+**Problem:** The server listens on `127.0.0.1` with no authentication and no origin check. While a user has FileReach running, **any web page in their browser** can issue `GET /api/index?...` / `POST`-style calls to the local port (simple cross-origin requests are *sent* even though responses are CORS-blocked). Impact is bounded by the read-only design but includes: triggering a full-disk re-index (local DoS / CPU+disk thrash), forcing `explorer` pop-ups via `/api/reveal`, and forcing OCR work. A preflighted JSON `POST` is mostly blocked by CORS, but `GET` and form `POST` are not.
+**Fix applied:** Added a `@app.before_request` same-origin guard. If an `Origin`/`Referer` header is present and does not match the request's own `Host`, the request is rejected with `403`. Requests with no origin header (direct navigation, the app itself, cURL) pass through unaffected.
+
+### 🟠 H2 — Shared SQLite connection across writer + reader threads
+**Where:** `engine.py` (`Indexer.connect`), `v1.0.0`.
+**Problem:** A single `sqlite3.Connection(check_same_thread=False)` is shared between the background indexing **writer** thread and the per-request **reader** threads. Under concurrent load this can raise `sqlite3.OperationalError: database table is locked` / `database is locked`, surfacing as intermittent HTTP 500s on search while a re-index runs. There was also **no re-entry guard**, so two rapid `POST /api/index` calls could spawn two writer threads corrupting the same rows.
+**Fix applied:**
+1. `PRAGMA busy_timeout=6000` — SQLite now waits up to 6 s for a lock instead of failing fast.
+2. `Indexer.is_busy()` + an HTTP `409` in `/api/index` — a second index attempt is rejected until the current one finishes or is cancelled.
+*(A connection-per-thread or a separate read replica remains the fully robust fix and is listed as a future hardening item — see §7.)*
+
+---
+
+## 5. Medium findings
+
+### 🟡 M1 — Unguarded `int(limit)` → HTTP 500
+**Where:** `app.py` (`api_search`), `v1.0.0`. `int(request.args.get("limit", 1000))` raised `ValueError` on `?limit=abc`.
+**Fix:** wrapped in `try/except (TypeError, ValueError)` → defaults to 1000.
+
+### 🟡 M2 — Dead/buggy code in `api_status`
+**Where:** `app.py`, `v1.0.0`. The handler assigned `indexed_roots` three times, including a `indexer.search_roots() if hasattr(...)` line that referenced a method that **does not exist**. It never crashed only because of the `hasattr` guard, but it was sloppy and did redundant work.
+**Fix:** replaced with a single clean grouped query.
+
+### 🟡 M3 — Pillow decompression-bomb handling in OCR
+**Where:** `app.py` (`api_ocr`). Pillow's default `MAX_IMAGE_PIXELS` already raises `DecompressionBombError` on pathological images, which is good — but it was not explicitly caught, so a bomb produced an opaque 500.
+**Fix:** explicitly set/keep the guard and catch `Image.DecompressionBombError` → clean per-image error. Uploads are already capped at 32 MB by `MAX_CONTENT_LENGTH`.
+
+### 🟡 M4 — Broken extension detection in OCR hint extraction
+**Where:** `app.py` (`extract_search_hints`), `v1.0.0`. The filter `any(e in s for s in TYPE_CATEGORIES)` checked membership of a **dot-less** token (`pdf`) against sets of **dotted** extensions (`.pdf`) — always `False`. It worked only because of a hardcoded fallback tuple.
+**Fix:** corrected to `any(("." + e) in s for s in TYPE_CATEGORIES.values())`.
+
+---
+
+## 6. Low findings
+
+| ID | Finding | Disposition |
+|----|---------|-------------|
+| **L1** | Unused imports (`sys`, `json`, `time`, `wraps`, `Response` in `app.py`; `sys` in `engine.py`) | Removed (pyflakes now clean). |
+| **L2** | Dead local variables (`base` in `stats()`, `as e` in `read_file_text`) | Removed. |
+| **L3** | Flask **development server** used for distribution | *Accepted risk* for a local single-user tool; documented. A production WSGI (Waitress) is a future option. |
+| **L4** | Markdown viewer renders `<a target="_blank">` without `rel="noopener"` | Minor; tab-nabbing only against the user's own local page. Future: add `rel="noopener noreferrer"`. |
+| **L5** | `kind` column never holds `spreadsheets`/`presentations` (overlap with `documents`, first-match wins) | *By design* — documented inline; the type-chips filter correctly via the category sets directly. |
+| **L6** | Sensitive data (file paths, OCR text) written to an unencrypted log in `%LOCALAPPDATA%\FileReach\` | *Accepted risk*; standard for local tools. Future: redact or make logging opt-in. |
+
+---
+
+## 7. Robustness assessment
+
+| Dimension | Rating | Notes |
+|-----------|--------|-------|
+| **Data safety (no delete/duplicate)** | ✅ Excellent | Verified by grep: zero destructive calls; read-only opens only. |
+| **SQL safety** | ✅ Excellent | 100% parameterized; `ORDER BY` and `IN` clauses built from fixed whitelists. |
+| **Input validation** | ✅ Good (after fix) | `limit`, `ext`, `type`, paths all validated/sandboxed. |
+| **Concurrency** | 🟡 Adequate (after fix) | `busy_timeout` + re-entry guard; per-thread connections are the next step. |
+| **Packaging / distribution** | ✅ Good (after fix) | Frozen-path fixed; CI builds all three OSes; macOS unsigned (documented). |
+| **Error handling** | ✅ Good | Walk errors counted, not fatal; OCR/upload errors isolated per file. |
+| **Network exposure** | ✅ Excellent | `127.0.0.1`-only; now CSRF-hardened. |
+| **XSS (UI)** | ✅ Good | Central `esc()` helper; viewer uses `textContent` / sandboxed iframe (scripts off). |
+
+**Accepted residual risk:** multi-user shared machines (another local user could reach the port) and the dev-server choice (L3) are the only items a hardened deployment should revisit.
+
+---
+
+## 8. Remediation summary (this pass)
+
+| Fix | Files | Severity |
+|-----|-------|----------|
+| Frozen-path resolution (`sys._MEIPASS`) | `app.py` | 🔴 C1 |
+| Same-Origin CSRF enforcement | `app.py` | 🟠 H1 |
+| `busy_timeout` + `is_busy()` + `409` re-entry guard | `engine.py`, `app.py` | 🟠 H2 |
+| `int(limit)` try/except | `app.py` | 🟡 M1 |
+| Clean `api_status` | `app.py` | 🟡 M2 |
+| Pillow bomb guard + explicit catch | `app.py` | 🟡 M3 |
+| OCR extension-detection logic | `app.py` | 🟡 M4 |
+| Removed unused imports / dead vars | `app.py`, `engine.py` | ⚪ L1–L2 |
+| `include_folders` wired through `SearchEngine.search()` | `engine.py`, `app.py` | (consistency) |
+| `.gitattributes` (normalise LF, keep `.bat` CRLF) | `.gitattributes` | (tooling) |
+
+All fixes verified: `pyflakes` clean, full integration test suite passes (same/cross-origin, malformed input, folder search, status grouping).
+
+---
+
+## 9. Recommended next steps
+
+1. **Cut `v1.0.1`** from the fixed code and re-tag so CI republishes working binaries (the `v1.0.0` binaries on the Releases page should be treated as broken — see C1).
+2. Consider per-thread SQLite read connections (or a read replica) to fully retire H2.
+3. Optional: ship behind Waitress and add a one-time local auth token for defense-in-depth.
+4. Add `rel="noopener noreferrer"` to rendered markdown links (L4).
+
+---
+
+*Prepared 2026-06-30. Re-run this audit after any change to `engine.py`, `app.py`, or the build pipeline.*
+
+
+
+=== FILE: static\index.html ===
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FileReach — Search</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  /* ===================== LIGHT (Linen) ===================== */
+  :root{
+    --bg-canvas:#EDE8DC; --bg-canvas-edge:#E4DECE;
+    --bg-window:#FBF9F4; --bg-toolbar:#F3EFE3;
+    --bg-tab-inactive:#E9E4D5; --bg-card:#FFFFFF; --bg-card-soft:#F8F5EC;
+    --border-subtle:#E2DCC9; --border-soft:#EAE4D3; --bd-hi:rgba(255,255,255,.6);
+    --text-primary:#2A2823; --text-secondary:#8C8674; --text-tertiary:#B8B19C;
+    --accent-coral:#E2664E; --accent-coral-deep:#C84F39; --accent-coral-soft:#FBE7E0;
+    --accent-yellow:#E8B23D; --accent-green:#5DA46C; --accent-green-soft:#E3EFE0;
+    --accent-blue:#5B8DB8; --accent-purple:#8366A8; --accent-teal:#3FA2A0;
+    --overlay-tint:rgba(0,0,0,.04); --code-bg:rgba(0,0,0,.04);
+    --shadow-window:0 30px 70px -20px rgba(42,40,35,.35),0 10px 25px -10px rgba(42,40,35,.18);
+    --shadow-card-sm:0 2px 6px -2px rgba(42,40,35,.10),0 1px 2px rgba(42,40,35,.06);
+    --shadow-card-md:0 14px 30px -10px rgba(42,40,35,.18),0 4px 10px -4px rgba(42,40,35,.10);
+    --shadow-card-lg:0 26px 50px -16px rgba(42,40,35,.24),0 8px 16px -6px rgba(42,40,35,.12);
+    --ease:cubic-bezier(.22,1,.36,1);
+    --kind-images:var(--accent-coral); --kind-videos:var(--accent-purple);
+    --kind-audio:var(--accent-green); --kind-documents:var(--accent-blue);
+    --kind-code:var(--accent-teal); --kind-archives:var(--accent-yellow);
+    --kind-fonts:var(--accent-purple); --kind-other:var(--text-tertiary); --kind-folder:#C8A24A;
+  }
+  /* ===================== DARK (warm charcoal, keeps linen accents) ===================== */
+  :root[data-theme="dark"]{
+    --bg-canvas:#17150F; --bg-canvas-edge:#100E0A;
+    --bg-window:#211E18; --bg-toolbar:#26221C;
+    --bg-tab-inactive:#2E2922; --bg-card:#27231D; --bg-card-soft:#2F2A23;
+    --border-subtle:#383229; --border-soft:#2E2922; --bd-hi:rgba(255,255,255,.05);
+    --text-primary:#EDE7D8; --text-secondary:#A39A86; --text-tertiary:#716A5B;
+    --accent-coral:#F07A60; --accent-coral-deep:#FF8E72; --accent-coral-soft:#3A241E;
+    --accent-yellow:#F0BE4E; --accent-green:#74C084; --accent-green-soft:#1F3327;
+    --accent-blue:#7AAFD6; --accent-purple:#A684CA; --accent-teal:#4FB9B6;
+    --overlay-tint:rgba(255,255,255,.04); --code-bg:rgba(255,255,255,.05);
+    --kind-folder:#E0B45A;
+    --shadow-window:0 30px 70px -20px rgba(0,0,0,.65),0 10px 25px -10px rgba(0,0,0,.45);
+    --shadow-card-sm:0 2px 6px -2px rgba(0,0,0,.45),0 1px 2px rgba(0,0,0,.30);
+    --shadow-card-md:0 14px 30px -10px rgba(0,0,0,.55),0 4px 10px -4px rgba(0,0,0,.35);
+    --shadow-card-lg:0 26px 50px -16px rgba(0,0,0,.65),0 8px 16px -6px rgba(0,0,0,.40);
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;}
+  body{
+    min-height:100vh;
+    background:
+      radial-gradient(ellipse 90% 55% at 50% -12%, var(--bg-card-soft) 0%, transparent 60%),
+      linear-gradient(180deg, var(--bg-canvas) 0%, var(--bg-canvas-edge) 100%);
+    font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;
+    color:var(--text-primary); -webkit-font-smoothing:antialiased;
+    overflow-x:hidden; transition:background .3s var(--ease);
+  }
+  @media (prefers-reduced-motion:reduce){*{animation-duration:.001ms!important;transition-duration:.001ms!important;}}
+
+  .app{max-width:1240px;margin:0 auto;padding:26px 22px 60px;opacity:0;transform:translateY(14px);animation:appIn .6s var(--ease) forwards;}
+  @keyframes appIn{to{opacity:1;transform:translateY(0);}}
+
+  /* ---------- Topbar ---------- */
+  .topbar{display:flex;align-items:center;gap:12px;margin-bottom:22px;background:var(--bg-window);border:1px solid var(--bd-hi);border-radius:18px;box-shadow:var(--shadow-card-md);padding:14px 18px;}
+  .brand{display:flex;align-items:center;gap:12px;flex-shrink:0;}
+  .brand-mark{width:42px;height:42px;border-radius:13px;display:grid;place-items:center;background:linear-gradient(155deg,#EF7A60,#C84F39);box-shadow:0 10px 22px -8px rgba(200,79,57,.6),inset 0 1px 0 rgba(255,255,255,.35);transform:perspective(400px) rotateY(0deg);transition:transform .4s var(--ease);}
+  .brand-mark svg{width:22px;height:22px;color:#fff;}
+  .brand:hover .brand-mark{transform:perspective(400px) rotateY(16deg);}
+  .brand-text .name{font-size:17px;font-weight:700;letter-spacing:-.01em;line-height:1.1;}
+  .brand-text .sub{font-size:11.5px;color:var(--text-secondary);font-weight:500;}
+  .status-pill{display:flex;align-items:center;gap:8px;padding:7px 13px;border-radius:30px;font-size:12.5px;font-weight:600;background:var(--bg-card-soft);border:1px solid var(--border-soft);color:var(--text-secondary);white-space:nowrap;}
+  .status-dot{width:8px;height:8px;border-radius:50%;background:var(--text-tertiary);}
+  .status-pill.idle .status-dot{background:var(--text-tertiary);}
+  .status-pill.indexing .status-dot{background:var(--accent-yellow);animation:pulse 1.1s infinite;}
+  .status-pill.done .status-dot{background:var(--accent-green);}
+  .status-pill.error .status-dot{background:var(--accent-coral);}
+  @keyframes pulse{0%,100%{opacity:1;transform:scale(1);}50%{opacity:.4;transform:scale(.7);}}
+  .topbar-spacer{flex:1;}
+  .btn{border:1px solid var(--border-subtle);background:var(--bg-card);color:var(--text-primary);font-family:inherit;font-size:13px;font-weight:600;padding:9px 15px;border-radius:11px;cursor:pointer;display:inline-flex;align-items:center;gap:8px;transition:all .18s var(--ease);box-shadow:var(--shadow-card-sm);white-space:nowrap;}
+  .btn svg{width:15px;height:15px;}
+  .btn:hover{transform:translateY(-1px);box-shadow:var(--shadow-card-md);}
+  .btn:active{transform:translateY(0) scale(.98);}
+  .btn.primary{background:linear-gradient(155deg,#EF7A60,#C84F39);color:#fff;border-color:transparent;box-shadow:0 10px 22px -8px rgba(200,79,57,.55),inset 0 1px 0 rgba(255,255,255,.3);}
+  .btn.primary:hover{filter:brightness(1.04);}
+  .btn.ghost{background:transparent;border-color:transparent;box-shadow:none;color:var(--text-secondary);}
+  .btn.ghost:hover{background:var(--overlay-tint);box-shadow:none;}
+  .btn.small{padding:6px 11px;font-size:12px;border-radius:9px;}
+
+  /* ---------- Search card ---------- */
+  .search-card{background:var(--bg-window);border:1px solid var(--bd-hi);border-radius:20px;box-shadow:var(--shadow-card-md);padding:22px;margin-bottom:18px;}
+  .search-row{display:flex;gap:12px;align-items:stretch;}
+  .search-box{flex:1;display:flex;align-items:flex-start;gap:12px;min-height:54px;padding:8px 8px 8px 18px;border-radius:15px;background:var(--bg-card);border:1px solid var(--border-subtle);box-shadow:inset 0 1px 2px var(--code-bg);transition:border-color .2s var(--ease),box-shadow .2s var(--ease);}
+  .search-box:focus-within{border-color:var(--accent-coral);box-shadow:0 0 0 3px rgba(226,102,78,.13);}
+  .search-box .lead{width:20px;height:20px;color:var(--text-tertiary);flex-shrink:0;margin-top:9px;}
+  .kbd-hint{font-size:10px;font-weight:700;color:var(--text-tertiary);background:var(--bg-card-soft);border:1px solid var(--border-soft);border-radius:6px;padding:3px 7px;align-self:center;white-space:nowrap;}
+  .search-box textarea{flex:1;border:none;outline:none;background:transparent;resize:none;font-family:inherit;font-size:15px;color:var(--text-primary);line-height:1.5;padding:8px 0;max-height:120px;overflow-y:auto;}
+  .search-box textarea::placeholder{color:var(--text-tertiary);}
+  .go-btn{align-self:stretch;border:none;border-radius:12px;padding:0 22px;cursor:pointer;background:linear-gradient(155deg,#EF7A60,#C84F39);color:#fff;font-family:inherit;font-size:14px;font-weight:600;display:inline-flex;align-items:center;gap:8px;box-shadow:0 10px 22px -8px rgba(200,79,57,.55),inset 0 1px 0 rgba(255,255,255,.3);transition:all .18s var(--ease);}
+  .go-btn:hover{filter:brightness(1.05);transform:translateY(-1px);}
+  .go-btn:active{transform:translateY(0) scale(.98);}
+  .go-btn svg{width:17px;height:17px;}
+
+  /* filter row */
+  .filter-row{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:16px;}
+  .chip-group-label{font-size:11px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:var(--text-tertiary);margin-right:2px;}
+  .chips{display:flex;flex-wrap:wrap;gap:7px;}
+  .chip{display:inline-flex;align-items:center;gap:7px;padding:7px 13px;border-radius:30px;font-size:12.5px;font-weight:600;cursor:pointer;user-select:none;background:var(--bg-card);border:1px solid var(--border-subtle);color:var(--text-secondary);transition:all .16s var(--ease);}
+  .chip:hover{transform:translateY(-1px);box-shadow:var(--shadow-card-sm);color:var(--text-primary);}
+  .chip .dotc{width:8px;height:8px;border-radius:50%;}
+  .chip.active{background:var(--accent-coral-soft);border-color:var(--accent-coral);color:var(--accent-coral-deep);}
+  .chip.active .dotc{background:var(--accent-coral)!important;}
+  .scope-chip{display:inline-flex;align-items:center;gap:8px;padding:7px 8px 7px 13px;border-radius:30px;font-size:12.5px;font-weight:600;background:var(--accent-green-soft);border:1px solid var(--border-soft);color:var(--accent-green);max-width:340px;}
+  .scope-chip .spath{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:230px;}
+  .scope-chip .clear{border:none;background:var(--overlay-tint);width:18px;height:18px;border-radius:50%;cursor:pointer;color:var(--accent-green);display:grid;place-items:center;flex-shrink:0;}
+  .scope-chip .clear:hover{background:var(--border-soft);}
+  .scope-chip .clear svg{width:10px;height:10px;}
+  .sort-wrap{display:flex;align-items:center;gap:8px;margin-left:auto;}
+  .sort-wrap label{font-size:11px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:var(--text-tertiary);}
+  .sort-select{appearance:none;font-family:inherit;font-size:12.5px;font-weight:600;color:var(--text-primary);background:var(--bg-card) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238C8674' stroke-width='2.5'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E") no-repeat right 11px center;padding:8px 32px 8px 13px;border:1px solid var(--border-subtle);border-radius:10px;cursor:pointer;box-shadow:var(--shadow-card-sm);}
+
+  /* ---------- Stats banner ---------- */
+  .stats-banner{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:16px;}
+  .stat-card{background:var(--bg-card);border:1px solid var(--border-soft);border-radius:15px;padding:15px 17px;box-shadow:var(--shadow-card-sm);display:flex;flex-direction:column;gap:4px;}
+  .stat-card .label{font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--text-tertiary);}
+  .stat-card .value{font-size:22px;font-weight:700;letter-spacing:-.02em;color:var(--text-primary);}
+  .stat-card .value.sm{font-size:15px;font-weight:600;}
+  .stat-card.accent .value{color:var(--accent-coral-deep);}
+
+  /* ---------- Disk cards (idle) ---------- */
+  .disk-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin-top:8px;}
+  .disk-card{background:var(--bg-card);border:1px solid var(--border-soft);border-radius:15px;padding:16px 18px;box-shadow:var(--shadow-card-sm);}
+  .disk-card .dl{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:700;color:var(--text-primary);margin-bottom:10px;}
+  .disk-card .dl svg{width:16px;height:16px;color:var(--accent-coral);}
+  .disk-card .duse{font-size:12px;color:var(--text-secondary);display:flex;justify-content:space-between;margin-bottom:6px;}
+  .disk-bar{height:8px;background:var(--bg-card-soft);border-radius:8px;overflow:hidden;}
+  .disk-bar i{display:block;height:100%;background:linear-gradient(90deg,var(--accent-yellow),var(--accent-coral));border-radius:8px;}
+  .disk-card .dfree{font-size:11px;color:var(--text-tertiary);margin-top:8px;}
+
+  /* ---------- Results ---------- */
+  .results-head{display:flex;align-items:center;justify-content:space-between;margin:4px 4px 12px;}
+  .results-head h2{margin:0;font-size:14px;font-weight:700;letter-spacing:-.005em;}
+  .results-head .count{color:var(--text-secondary);font-weight:500;}
+  .result-list{display:flex;flex-direction:column;gap:8px;}
+  .row{display:flex;align-items:center;gap:14px;padding:13px 16px;border-radius:14px;background:var(--bg-card);border:1px solid var(--border-soft);box-shadow:var(--shadow-card-sm);transition:all .18s var(--ease);cursor:default;}
+  .row:hover{transform:translateY(-2px);box-shadow:var(--shadow-card-md);border-color:var(--border-subtle);}
+  .row .ic{width:40px;height:40px;border-radius:11px;flex-shrink:0;display:grid;place-items:center;background:var(--bg-card-soft);border:1px solid var(--border-soft);}
+  .row .ic svg{width:19px;height:19px;}
+  .row .meta{flex:1;min-width:0;}
+  .row .fname{font-size:14px;font-weight:600;color:var(--text-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:flex;align-items:center;gap:8px;}
+  .row .fpath{font-size:11.5px;color:var(--text-tertiary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:'Inter',monospace;margin-top:2px;}
+  .row .tag{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;padding:2px 7px;border-radius:20px;background:var(--bg-card-soft);color:var(--text-secondary);flex-shrink:0;}
+  .row .fsize{font-size:12px;font-weight:600;color:var(--text-secondary);width:78px;text-align:right;flex-shrink:0;}
+  .row .fdate{font-size:11.5px;color:var(--text-tertiary);width:92px;text-align:right;flex-shrink:0;}
+  .row .acts{display:flex;gap:6px;flex-shrink:0;}
+  .iconbtn{width:32px;height:32px;border-radius:9px;border:1px solid var(--border-soft);background:var(--bg-card-soft);color:var(--text-secondary);cursor:pointer;display:grid;place-items:center;transition:all .15s var(--ease);}
+  .iconbtn svg{width:15px;height:15px;}
+  .iconbtn:hover{background:var(--accent-coral);border-color:var(--accent-coral);color:#fff;transform:translateY(-1px);}
+  .iconbtn.path:hover{background:var(--accent-green);border-color:var(--accent-green);}
+  .iconbtn[disabled]{opacity:.35;cursor:not-allowed;}
+  .iconbtn[disabled]:hover{background:var(--bg-card-soft);border-color:var(--border-soft);color:var(--text-secondary);transform:none;}
+  .match-badge{font-size:10px;font-weight:700;color:var(--accent-coral-deep);background:var(--accent-coral-soft);padding:2px 6px;border-radius:6px;flex-shrink:0;}
+
+  .state-box{padding:54px 24px;text-align:center;color:var(--text-secondary);}
+  .state-box .big-ic{width:64px;height:64px;border-radius:18px;margin:0 auto 18px;display:grid;place-items:center;background:var(--bg-card);border:1px solid var(--border-soft);box-shadow:var(--shadow-card-sm);}
+  .state-box .big-ic svg{width:28px;height:28px;color:var(--accent-coral);}
+  .state-box h3{margin:0 0 6px;font-size:16px;color:var(--text-primary);}
+  .state-box p{margin:0 auto;font-size:13px;line-height:1.6;max-width:460px;}
+  .spinner{width:30px;height:30px;border:3px solid var(--border-subtle);border-top-color:var(--accent-coral);border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 16px;}
+  @keyframes spin{to{transform:rotate(360deg);}}
+
+  /* ---------- Modal ---------- */
+  .overlay{position:fixed;inset:0;background:rgba(20,18,14,.5);backdrop-filter:blur(6px);display:flex;align-items:center;justify-content:center;padding:24px;z-index:200;opacity:0;pointer-events:none;transition:opacity .25s var(--ease);}
+  .overlay.show{opacity:1;pointer-events:auto;}
+  .modal{background:var(--bg-window);border-radius:20px;box-shadow:var(--shadow-window);width:100%;max-width:1000px;max-height:88vh;display:flex;flex-direction:column;overflow:hidden;border:1px solid var(--bd-hi);transform:translateY(16px) scale(.98);transition:transform .3s var(--ease);}
+  .overlay.show .modal{transform:translateY(0) scale(1);}
+  .modal-head{display:flex;align-items:center;gap:12px;padding:15px 18px;background:var(--bg-toolbar);border-bottom:1px solid var(--border-subtle);}
+  .modal-head .mic{width:34px;height:34px;border-radius:10px;display:grid;place-items:center;flex-shrink:0;background:var(--bg-card);border:1px solid var(--border-soft);}
+  .modal-head .mic svg{width:17px;height:17px;}
+  .modal-head .mtitle{flex:1;min-width:0;}
+  .modal-head .mtitle .t{font-size:14px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .modal-head .mtitle .s{font-size:11.5px;color:var(--text-tertiary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .modal-body{flex:1;overflow:auto;padding:24px;background:var(--bg-window);}
+  .modal-foot{padding:11px 18px;background:var(--bg-toolbar);border-top:1px solid var(--border-subtle);display:flex;align-items:center;gap:14px;font-size:12px;color:var(--text-secondary);}
+  .nav-arrow{position:fixed;top:50%;transform:translateY(-50%);width:46px;height:46px;border-radius:50%;background:var(--bg-card);border:1px solid var(--border-soft);box-shadow:var(--shadow-card-md);display:grid;place-items:center;cursor:pointer;color:var(--text-secondary);z-index:210;transition:all .18s var(--ease);}
+  .nav-arrow:hover{background:var(--accent-coral);color:#fff;border-color:var(--accent-coral);transform:translateY(-50%) scale(1.08);}
+  .nav-arrow.left{left:30px;} .nav-arrow.right{right:30px;}
+  .nav-arrow svg{width:20px;height:20px;}
+
+  /* viewers */
+  .viewer-img{display:block;max-width:100%;max-height:72vh;margin:0 auto;border-radius:12px;box-shadow:var(--shadow-card-md);}
+  pre.code{margin:0;font-family:'JetBrains Mono','SF Mono','Menlo','Consolas',monospace;font-size:12.5px;line-height:1.6;white-space:pre-wrap;word-break:break-word;color:var(--text-primary);}
+  pre.code .kw{color:var(--accent-coral-deep);font-weight:600;}
+  pre.code .str{color:var(--accent-green);}
+  pre.code .com{color:var(--text-tertiary);font-style:italic;}
+  pre.code .num{color:var(--accent-purple);}
+  pre.code .tag-name{color:var(--accent-teal);}
+  .md-body{font-size:14.5px;line-height:1.75;color:var(--text-primary);max-width:720px;margin:0 auto;}
+  .md-body h1{font-size:26px;margin:0 0 14px;letter-spacing:-.02em;} .md-body h2{font-size:21px;margin:26px 0 12px;}
+  .md-body h3{font-size:17px;margin:22px 0 10px;} .md-body p{margin:0 0 14px;}
+  .md-body ul,.md-body ol{margin:0 0 14px;padding-left:22px;} .md-body li{margin-bottom:5px;}
+  .md-body code{background:var(--bg-card-soft);padding:2px 6px;border-radius:5px;font-size:13px;font-family:'JetBrains Mono','SF Mono',monospace;color:var(--accent-coral-deep);}
+  .md-body pre{background:var(--bg-card-soft);border:1px solid var(--border-soft);border-radius:12px;padding:16px;overflow:auto;margin:0 0 16px;}
+  .md-body pre code{background:none;padding:0;color:var(--text-primary);}
+  .md-body blockquote{border-left:3px solid var(--accent-coral);margin:0 0 14px;padding:4px 16px;color:var(--text-secondary);}
+  .md-body a{color:var(--accent-coral-deep);}
+  .md-body hr{border:none;border-top:1px solid var(--border-subtle);margin:22px 0;}
+  .render-iframe{width:100%;height:72vh;border:1px solid var(--border-soft);border-radius:12px;background:#fff;}
+  .view-toggle{display:flex;gap:6px;background:var(--bg-card-soft);padding:4px;border-radius:11px;margin-bottom:16px;}
+  .view-toggle button{border:none;background:transparent;font-family:inherit;font-size:12.5px;font-weight:600;padding:7px 15px;border-radius:8px;cursor:pointer;color:var(--text-secondary);transition:all .15s var(--ease);}
+  .view-toggle button.active{background:var(--bg-card);color:var(--text-primary);box-shadow:var(--shadow-card-sm);}
+
+  /* ---------- Folder picker ---------- */
+  .pick-search{display:flex;align-items:center;gap:8px;background:var(--bg-card);border:1px solid var(--border-subtle);border-radius:11px;padding:8px 12px;margin-bottom:12px;}
+  .pick-search svg{width:15px;height:15px;color:var(--text-tertiary);flex-shrink:0;}
+  .pick-search input{flex:1;border:none;outline:none;background:transparent;font-family:inherit;font-size:13px;color:var(--text-primary);}
+  .pick-search input::placeholder{color:var(--text-tertiary);}
+  .picker-grid{display:grid;grid-template-columns:1fr;gap:4px;}
+  .pick-item{display:flex;align-items:center;gap:11px;padding:11px 13px;border-radius:11px;cursor:pointer;transition:background .14s var(--ease);}
+  .pick-item:hover{background:var(--bg-card-soft);}
+  .pick-item svg{width:18px;height:18px;color:var(--accent-yellow);flex-shrink:0;}
+  .pick-item .pn{flex:1;font-size:13.5px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .pick-item .psize{font-size:11.5px;color:var(--text-tertiary);white-space:nowrap;min-width:54px;text-align:right;}
+  .pick-item .choose{font-size:11px;font-weight:700;color:var(--accent-coral-deep);opacity:0;transition:opacity .14s;}
+  .pick-item:hover .choose{opacity:1;}
+  .crumb{display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:12px;color:var(--text-secondary);margin-bottom:14px;padding:11px 14px;background:var(--bg-card-soft);border-radius:11px;}
+  .crumb a{cursor:pointer;color:var(--accent-coral-deep);font-weight:600;}
+  .crumb a:hover{text-decoration:underline;}
+  .crumb .sep{color:var(--text-tertiary);}
+
+  /* ---------- OCR chat panel ---------- */
+  .chat-panel{position:fixed;right:0;top:0;bottom:0;width:440px;max-width:92vw;z-index:180;background:var(--bg-window);box-shadow:var(--shadow-window);border-left:1px solid var(--border-subtle);transform:translateX(100%);transition:transform .35s var(--ease);display:flex;flex-direction:column;}
+  .chat-panel.show{transform:translateX(0);}
+  .chat-head{display:flex;align-items:center;gap:11px;padding:16px 18px;border-bottom:1px solid var(--border-subtle);background:var(--bg-toolbar);}
+  .chat-head .h-ic{width:34px;height:34px;border-radius:10px;background:linear-gradient(155deg,#a07bd0,#8366A8);display:grid;place-items:center;color:#fff;}
+  .chat-head .h-ic svg{width:17px;height:17px;}
+  .chat-head .ht{font-size:14px;font-weight:700;} .chat-head .hs{font-size:11px;color:var(--text-tertiary);}
+  .chat-body{flex:1;overflow-y:auto;padding:18px;display:flex;flex-direction:column;gap:14px;}
+  .chat-msg{max-width:88%;} .chat-msg.bot{align-self:flex-start;} .chat-msg.user{align-self:flex-end;}
+  .bubble{padding:12px 15px;border-radius:16px;font-size:13px;line-height:1.6;}
+  .chat-msg.bot .bubble{background:var(--bg-card-soft);border:1px solid var(--border-soft);border-bottom-left-radius:5px;color:var(--text-primary);}
+  .chat-msg.user .bubble{background:linear-gradient(155deg,#EF7A60,#C84F39);color:#fff;border-bottom-right-radius:5px;}
+  .bubble img{max-width:100%;border-radius:10px;margin-top:8px;display:block;}
+  .ocr-text{font-family:'JetBrains Mono','SF Mono',monospace;font-size:11.5px;white-space:pre-wrap;background:var(--code-bg);padding:10px;border-radius:9px;margin-top:8px;max-height:160px;overflow:auto;color:var(--text-secondary);}
+  .sugg-grid{display:flex;flex-wrap:wrap;gap:7px;margin-top:10px;}
+  .sugg{border:1px solid var(--border-soft);background:var(--bg-card);font-family:inherit;font-size:12px;font-weight:600;padding:6px 11px;border-radius:20px;cursor:pointer;color:var(--text-secondary);transition:all .15s var(--ease);}
+  .sugg:hover{background:var(--accent-coral-soft);border-color:var(--accent-coral);color:var(--accent-coral-deep);transform:translateY(-1px);}
+  .chat-foot{padding:13px;border-top:1px solid var(--border-subtle);background:var(--bg-toolbar);}
+  .dropzone{border:2px dashed var(--border-subtle);border-radius:13px;padding:18px;text-align:center;cursor:pointer;transition:all .18s var(--ease);color:var(--text-secondary);font-size:12.5px;font-weight:500;}
+  .dropzone:hover,.dropzone.drag{border-color:var(--accent-coral);background:var(--accent-coral-soft);color:var(--accent-coral-deep);}
+  .dropzone svg{width:22px;height:22px;margin:0 auto 8px;display:block;}
+  .fab{position:fixed;right:24px;bottom:24px;width:56px;height:56px;border-radius:50%;cursor:pointer;border:none;background:linear-gradient(155deg,#a07bd0,#8366A8);color:#fff;display:grid;place-items:center;box-shadow:0 14px 30px -8px rgba(131,102,168,.6);z-index:150;transition:all .2s var(--ease);}
+  .fab:hover{transform:translateY(-3px) scale(1.05);} .fab svg{width:24px;height:24px;}
+
+  .toast-wrap{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);z-index:300;display:flex;flex-direction:column;gap:8px;align-items:center;}
+  .toast{background:var(--text-primary);color:var(--bg-window);padding:11px 18px;border-radius:11px;font-size:13px;font-weight:500;box-shadow:var(--shadow-card-md);opacity:0;transform:translateY(10px);transition:all .25s var(--ease);}
+  .toast.show{opacity:1;transform:translateY(0);}
+
+  @media (max-width:760px){.topbar{flex-wrap:wrap;}.status-pill{order:4;}.row .fdate{display:none;}.nav-arrow{display:none;}.search-row{flex-direction:column;}.go-btn{padding:14px;}.kbd-hint{display:none;}}
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="topbar">
+    <div class="brand">
+      <div class="brand-mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg></div>
+      <div class="brand-text"><div class="name">FileReach</div><div class="sub">Read-only file search</div></div>
+    </div>
+    <div class="status-pill idle" id="statusPill"><span class="status-dot"></span><span id="statusText">Checking…</span></div>
+    <div class="topbar-spacer"></div>
+    <button class="btn ghost small" id="btnBrowse" title="Open the system folder picker (instant, no index needed)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M12 11v4M10 13h4" stroke-linecap="round"/></svg>Browse</button>
+    <button class="btn ghost small" id="btnScope" title="Browse drives/folders inside FileReach">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>Folder</button>
+    <button class="btn" id="btnIndex"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 12a9 9 0 1 1-3-6.7M21 4v5h-5"/></svg>Re-index</button>
+    <button class="btn ghost small" id="btnTheme" title="Toggle dark mode">
+      <svg id="iconMoon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+    </button>
+  </div>
+
+  <div class="search-card">
+    <div class="search-row">
+      <div class="search-box">
+        <svg class="lead" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+        <textarea id="searchInput" rows="1" placeholder="Search by name… (several at once, one per line or comma). Type .pdf for an extension. Ctrl+K here."></textarea>
+        <span class="kbd-hint">Ctrl K</span>
+      </div>
+      <button class="go-btn" id="btnSearch"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>Search</button>
+    </div>
+    <div class="filter-row">
+      <span class="chip-group-label">Type</span>
+      <div class="chips" id="typeChips">
+        <span class="chip" data-type="images"><span class="dotc" style="background:var(--kind-images)"></span>Images</span>
+        <span class="chip" data-type="videos"><span class="dotc" style="background:var(--kind-videos)"></span>Videos</span>
+        <span class="chip" data-type="audio"><span class="dotc" style="background:var(--kind-audio)"></span>Audio</span>
+        <span class="chip" data-type="documents"><span class="dotc" style="background:var(--kind-documents)"></span>Documents</span>
+        <span class="chip" data-type="code"><span class="dotc" style="background:var(--kind-code)"></span>Code</span>
+        <span class="chip" data-type="archives"><span class="dotc" style="background:var(--kind-archives)"></span>Archives</span>
+      </div>
+      <div id="scopeHolder" style="display:flex;gap:7px;align-items:center;"></div>
+      <div class="sort-wrap"><label>Sort</label>
+        <select class="sort-select" id="sortSelect">
+          <option value="relevance">Best match</option>
+          <option value="name-asc">Name A → Z</option>
+          <option value="name-desc">Name Z → A</option>
+          <option value="modified-desc">Newest modified</option>
+          <option value="modified-asc">Oldest modified</option>
+          <option value="created-desc">Newest created</option>
+          <option value="created-asc">Oldest created</option>
+          <option value="size-desc">Largest</option>
+          <option value="size-asc">Smallest</option>
+        </select>
+      </div>
+    </div>
+  </div>
+
+  <div id="statsBanner" class="stats-banner" style="display:none;"></div>
+  <div id="resultsArea"></div>
+</div>
+
+<!-- Viewer -->
+<div class="overlay" id="viewerOverlay">
+  <div class="nav-arrow left" id="navPrev" title="Previous (←)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M15 18l-6-6 6-6"/></svg></div>
+  <div class="modal">
+    <div class="modal-head">
+      <div class="mic" id="vmic"></div>
+      <div class="mtitle"><div class="t" id="vtitle">—</div><div class="s" id="vpath">—</div></div>
+      <button class="iconbtn path" id="vReveal" title="Show in file explorer"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button>
+      <button class="iconbtn" id="vCopy" title="Copy path"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg></button>
+      <button class="iconbtn" id="vClose" title="Close (Esc)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+    </div>
+    <div class="modal-body" id="vbody"></div>
+    <div class="modal-foot"><span id="vFoot">—</span><span style="flex:1"></span><span style="color:var(--text-tertiary)">Read-only · ← → navigate · Esc close</span></div>
+  </div>
+  <div class="nav-arrow right" id="navNext" title="Next (→)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M9 6l6 6-6 6"/></svg></div>
+</div>
+
+<!-- Folder picker -->
+<div class="overlay" id="pickerOverlay">
+  <div class="modal" style="max-width:560px;">
+    <div class="modal-head">
+      <div class="mic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" style="color:var(--accent-yellow)"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></div>
+      <div class="mtitle"><div class="t">Choose a folder to search within</div><div class="s">Sizes load as you browse</div></div>
+      <button class="iconbtn" id="pickClose"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+    </div>
+    <div class="modal-body">
+      <div class="pick-search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg><input id="pickFilter" placeholder="Filter folders by name…"></div>
+      <div class="crumb" id="pickCrumb"></div>
+      <div class="picker-grid" id="pickGrid"></div>
+    </div>
+    <div class="modal-foot">
+      <span style="color:var(--text-tertiary);font-size:11.5px">Tip: use <b>Browse</b> for the system folder dialog.</span>
+      <span style="flex:1"></span>
+      <button class="btn small" id="pickHere">Search this folder only</button>
+    </div>
+  </div>
+</div>
+
+<!-- OCR panel -->
+<button class="fab" id="fabOCR" title="Image → text search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 7V5a1 1 0 0 1 1-1h2M17 4h2a1 1 0 0 1 1 1v2M20 17v2a1 1 0 0 1-1 1h-2M7 20H5a1 1 0 0 1-1-1v-2"/><rect x="8" y="8" width="8" height="8" rx="1.5"/></svg></button>
+<div class="chat-panel" id="chatPanel">
+  <div class="chat-head">
+    <div class="h-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 7V5a1 1 0 0 1 1-1h2M17 4h2a1 1 0 0 1 1 1v2M20 17v2a1 1 0 0 1-1 1h-2M7 20H5a1 1 0 0 1-1-1v-2"/><rect x="8" y="8" width="8" height="8" rx="1.5"/></svg></div>
+    <div style="flex:1"><div class="ht">Image → Search</div><div class="hs" id="ocrStatus">Paste a photo to extract text</div></div>
+    <button class="iconbtn" id="chatClose"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+  </div>
+  <div class="chat-body" id="chatBody"></div>
+  <div class="chat-foot">
+    <div class="dropzone" id="dropzone">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 16V4M8 8l4-4 4 4M5 13v6a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-6"/></svg>
+      Drop or paste an image here — or click to upload
+      <input type="file" id="fileInput" accept="image/*" multiple style="display:none">
+    </div>
+  </div>
+</div>
+
+<div class="toast-wrap" id="toastWrap"></div>
+
+<script>
+const $=(s,el=document)=>el.querySelector(s), $$=(s,el=document)=>[...el.querySelectorAll(s)];
+const esc=s=>(s==null?'':String(s)).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+let API=(p,o={})=>fetch(p,o).then(r=>r.ok?r.json():r.json().then(e=>Promise.reject(e)));
+let currentResults=[], viewIndex=-1, activeType=null, scopeFolder=null, pickerCurrent='', pickerDirs=[];
+let lastReq=0;                       // dedupe in-flight searches
+function debounce(fn,ms){let t;return(...a)=>{clearTimeout(t);t=setTimeout(()=>fn(...a),ms);};}
+
+/* ---------- toast ---------- */
+function toast(msg){const t=document.createElement('div');t.className='toast';t.textContent=msg;$('#toastWrap').appendChild(t);requestAnimationFrame(()=>t.classList.add('show'));setTimeout(()=>{t.classList.remove('show');setTimeout(()=>t.remove(),300);},2600);}
+
+/* ---------- theme ---------- */
+function initTheme(){
+  const saved=localStorage.getItem('fr-theme');
+  if(saved) document.documentElement.setAttribute('data-theme',saved);
+  else if(window.matchMedia('(prefers-color-scheme:dark)').matches) document.documentElement.setAttribute('data-theme','dark');
+  paintThemeIcon();
+}
+function paintThemeIcon(){
+  const dark=document.documentElement.getAttribute('data-theme')==='dark';
+  $('#btnTheme').innerHTML = dark
+    ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>'
+    : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>';
+}
+
+const KIND_ICON={
+  images:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="8.5" cy="9.5" r="1.5"/><path d="M21 16l-5-5L5 20"/></svg>',
+  videos:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M10 9l5 3-5 3z"/></svg>',
+  audio:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M9 18V6l10-2v12"/><circle cx="6" cy="18" r="3"/><circle cx="16" cy="16" r="3"/></svg>',
+  documents:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M6 2h8l4 4v16H6z"/><path d="M14 2v4h4M9 13h6M9 17h6"/></svg>',
+  code:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M8 9l-3 3 3 3M16 9l3 3-3 3M13 7l-2 10"/></svg>',
+  archives:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8M10 12h4"/></svg>',
+  fonts:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M6 20l5-14 5 14M8 14h6"/></svg>',
+  folder:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>',
+  other:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M6 2h8l4 4v16H6z"/><path d="M14 2v4h4"/></svg>',
+};
+const kindIcon=k=>KIND_ICON[k]||KIND_ICON.other;
+
+/* ---------- status + idle disk ---------- */
+async function refreshStatus(){
+  try{
+    const s=await API('/api/status'); const pill=$('#statusPill'),txt=$('#statusText');
+    pill.className='status-pill '+s.state;
+    if(s.state==='indexing'){txt.textContent=`Indexing… ${s.indexed.toLocaleString()} files`;setTimeout(refreshStatus,900);}
+    else if(s.state==='done') txt.textContent=`Indexed · ${s.total_files.toLocaleString()} files · ${s.total_size_h}`;
+    else if(s.state==='error') txt.textContent='Index error';
+    else txt.textContent=s.total_files?`Indexed · ${s.total_files.toLocaleString()} files`:'Not indexed yet';
+    $('#ocrStatus').textContent=s.ocr_available?'Ready — drop a photo':'OCR needs Tesseract install';
+    // show disk cards only when the results area is in its idle (empty) state
+    if(!hasSearched && !$('#resultsArea').dataset.filled) renderIdle(s);
+  }catch(e){}
+}
+let hasSearched=false;
+async function renderIdle(s){
+  let disks='';
+  try{ const d=await API('/api/disk'); disks=d.disks.map(dk=>`
+    <div class="disk-card">
+      <div class="dl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg>${esc(dk.drive)}</div>
+      <div class="duse"><span>${esc(dk.used_h)} used</span><span>${esc(dk.percent)}%</span></div>
+      <div class="disk-bar"><i style="width:${dk.percent}%"></i></div>
+      <div class="dfree">${esc(dk.free_h)} free of ${esc(dk.total_h)}</div>
+    </div>`).join('');
+  }catch(e){}
+  $('#resultsArea').innerHTML=`<div class="state-box">
+    <div class="big-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg></div>
+    <h3>Search across your entire storage</h3>
+    <p>Type a name, pick a <b>type</b>, or enter an extension like <b>.pdf</b> for counts, total size, and first/last created dates. Press <b>Ctrl K</b> or any letter to start. Everything is read‑only.</p>
+    ${disks?`<div class="disk-grid">${disks}</div>`:''}
+  </div>`;
+}
+
+/* ---------- search (debounced, path-aware, live fallback) ---------- */
+function getQuery(){return $('#searchInput').value.trim();}
+function detectExt(q){
+  const t=q.replace(/^\./,'').toLowerCase();
+  if(/^[a-z0-9]{1,5}$/.test(t)&&q.includes('.')&&!q.includes(' ')&&q.length<=6) return t;
+  return null;
+}
+function looksLikePath(s){
+  if(!s) return false;
+  s=s.trim().replace(/^["']|["']$/g,'');
+  if(/^[A-Za-z]:[\\/]/.test(s)) return true;        // C:\... or C:/...
+  if(s.startsWith("\\\\")) return true;             // UNC \\server\share
+  if(s.startsWith("/")||s.startsWith("~/")||s==='/') return true;
+  return false;
+}
+// Parse a query that may embed a host path, e.g. "C:\Users\iassh\OneDrive\Documents"
+// or "C:\Users\iassh\Documents report". Returns {folder, nameQuery}.
+function parseQuery(raw){
+  let folder=null, nameQuery=raw;
+  const firstTok=raw.split(/\s+/)[0];
+  if(looksLikePath(firstTok)){
+    folder=firstTok.replace(/^["']|["']$/g,'');
+    nameQuery=raw.slice(firstTok.length).trim();
+  } else if(looksLikePath(raw)){
+    folder=raw.replace(/^["']|["']$/g,'');
+    nameQuery='';
+  }
+  return {folder, nameQuery};
+}
+const runSearch=debounce(doSearch,300);
+function doSearch(){
+  const raw=getQuery(), sort=$('#sortSelect').value;
+  const ext=detectExt(raw);
+  const parsed=parseQuery(raw);
+  const sendType=ext? null : activeType;            // ext overrides type chip
+  // Effective folder: explicit scope wins, else a path pasted into the query.
+  const folder = scopeFolder || parsed.folder;
+  const nameQuery = parsed.folder ? parsed.nameQuery : (ext? '' : raw);
+
+  if(!raw && !activeType){toast('Type a name, paste a path (e.g. C:\\Users\\you\\Docs), or use an extension');return;}
+
+  const myReq=++lastReq;
+  hasSearched=true;
+  $('#resultsArea').dataset.filled='1';
+  $('#resultsArea').innerHTML=loadingBox(folder? ('Scanning '+folder+' …') : 'Searching your storage…');
+  $('#statsBanner').style.display='none';
+
+  API('/api/search?'+new URLSearchParams({q:nameQuery, ext:ext||'', type:sendType||'', folder:folder||'', sort, limit:1500}))
+  .then(d=>{
+    if(myReq!==lastReq)return;
+    // Fallback: folder is set, index has 0 hits, and that folder is NOT indexed
+    // -> walk it live so the user always gets results (the "shows nothing" fix).
+    if(folder && d.count===0 && d.scope_indexed===false){
+      $('#resultsArea').innerHTML=loadingBox('Not indexed — live-scanning '+folder+' …');
+      return API('/api/live_search?'+new URLSearchParams({path:folder, q:nameQuery, ext:ext||'', type:sendType||'', limit:1500}))
+        .then(ld=>{ if(myReq!==lastReq)return; currentResults=ld.results; renderResults(ld, ext, folder, ld); });
+    }
+    currentResults=d.results; renderResults(d, ext, folder);
+    if((ext||sendType) && d.count>0){
+      return API('/api/stats?'+new URLSearchParams({ext:ext||'',type:sendType||'',folder:scopeFolder||''})).then(st=>renderStats(st, ext||sendType));
+    }
+  }).catch(err=>{
+    if(myReq!==lastReq)return;
+    // If the index search errored but we have a folder, still try live.
+    if(folder){
+      $('#resultsArea').innerHTML=loadingBox('Live-scanning '+folder+' …');
+      API('/api/live_search?'+new URLSearchParams({path:folder, q:nameQuery, ext:ext||'', type:sendType||'', limit:1500}))
+        .then(ld=>{ if(myReq!==lastReq)return; currentResults=ld.results; renderResults(ld, ext, folder, ld); })
+        .catch(e2=>{ if(myReq!==lastReq)return; $('#resultsArea').innerHTML=infoBox('⚠️ '+(e2.error||e2),'Could not read <b>'+esc(folder)+'</b>. The server console shows the exact error.');});
+      return;
+    }
+    $('#resultsArea').innerHTML=infoBox('⚠️ '+(err.error||'Search failed'),'Index a drive/folder first (Re-index), or paste a path to search it directly. Watch the server console for the exact error.');
+  });
+}
+function renderStats(st,label){
+  const b=$('#statsBanner'); b.style.display='grid';
+  b.innerHTML=`<div class="stat-card accent"><span class="label">${esc(label)} — count</span><span class="value">${st.count.toLocaleString()}</span></div>
+    <div class="stat-card"><span class="label">Total size</span><span class="value">${esc(st.total_size_h)}</span></div>
+    <div class="stat-card"><span class="label">First created</span><span class="value sm">${esc(st.first_created_h)}</span></div>
+    <div class="stat-card"><span class="label">Last created</span><span class="value sm">${esc(st.last_created_h)}</span></div>`;
+}
+function renderResults(d, ext, folder, live){
+  const area=$('#resultsArea');
+  if(!d.results.length){
+    const scopeNote = folder ? ` in <b>${esc(folder)}</b>` : '';
+    area.innerHTML=infoBox('No matches'+scopeNote,
+      'Genuinely nothing matched that name'+scopeNote+'. Check spelling, or try an extension like <b>.pdf</b>. ' +
+      (folder? 'The server console will confirm the scan finished.' : ''),true);return;
+  }
+  let srcLabel;
+  if(live){
+    srcLabel = `Live scan · ${d.scanned? d.scanned.toLocaleString()+' scanned · ':''}${d.elapsed||'?'}s`;
+    if(live.timed_out) srcLabel += ' · ⚠ partial (timed out)';
+    else if(live.truncated) srcLabel += ' · (capped at limit)';
+  } else {
+    srcLabel = d.fuzzy_used?'Relevance-ranked (fuzzy) · index':'Index';
+  }
+  let html=`<div class="results-head"><h2>Results <span class="count">· ${d.count.toLocaleString()} shown${folder? ' in '+esc(folder):''}</span></h2><span class="count">${esc(srcLabel)}</span></div><div class="result-list">`;
+  d.results.forEach((r,i)=>{
+    const k=r.kind||'other';
+    const score=r._score!=null&&r._score<100?`<span class="match-badge">${Math.round(r._score)}% related</span>`:'';
+    const viewable=r.is_viewable_text||r.is_image||r.is_renderable;
+    html+=`<div class="row" data-i="${i}"><div class="ic" style="color:var(--kind-${k})">${kindIcon(k)}</div>
+      <div class="meta"><div class="fname">${esc(r.name)} ${score}</div><div class="fpath">${esc(r.path)}</div></div>
+      <span class="tag">${esc((r.ext||'').replace('.','')||k)}</span>
+      <span class="fsize">${esc(r.size_h)}</span><span class="fdate">${esc(r.modified_h||'—')}</span>
+      <div class="acts">
+        ${viewable?`<button class="iconbtn" data-act="view" title="View"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg></button>`:''}
+        <button class="iconbtn path" data-act="reveal" title="Show in file explorer"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button>
+        <button class="iconbtn" data-act="copy" title="Copy path"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg></button>
+      </div></div>`;
+  });
+  area.innerHTML=html+'</div>';
+  $$('.row').forEach(row=>{const i=+row.dataset.i;
+    row.querySelector('[data-act="reveal"]').onclick=()=>revealPath(currentResults[i].path);
+    row.querySelector('[data-act="copy"]').onclick=()=>copyText(currentResults[i].path);
+    const v=row.querySelector('[data-act="view"]'); if(v)v.onclick=()=>openViewer(i);
+  });
+}
+function loadingBox(m){return `<div class="state-box"><div class="spinner"></div><p>${esc(m)}</p></div>`;}
+function infoBox(t,s,warn){return `<div class="state-box"><div class="big-ic">${warn?'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16h.01"/></svg>':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>'}</div><h3>${t}</h3><p>${s}</p></div>`;}
+async function revealPath(path){try{await API('/api/reveal',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path})});toast('Opened in file explorer');}catch(e){toast('Could not reveal: '+(e.error||e));}}
+async function copyText(t){try{await navigator.clipboard.writeText(t);toast('Path copied');}catch(e){const ta=document.createElement('textarea');ta.value=t;document.body.appendChild(ta);ta.select();try{document.execCommand('copy');toast('Path copied');}catch(_){toast('Copy failed');}ta.remove();}}
+
+/* ---------- viewer ---------- */
+async function openViewer(i){
+  viewIndex=i; const r=currentResults[i];
+  $('#viewerOverlay').classList.add('show');
+  $('#vbody').innerHTML='<div class="state-box"><div class="spinner"></div></div>';
+  $('#vtitle').textContent=r.name; $('#vpath').textContent=r.path;
+  $('#vmic').innerHTML=kindIcon(r.kind); $('#vmic').style.color=`var(--kind-${r.kind})`;
+  $('#vFoot').textContent=`${r.size_h} · modified ${r.modified_h||'—'} · ${i+1} / ${currentResults.length}`;
+  try{const f=await API('/api/file?'+new URLSearchParams({path:r.path}));renderViewerContent(f);}
+  catch(e){$('#vbody').innerHTML=infoBox('Cannot open',"This file type can't be previewed — use the folder icon to locate it.");}
+}
+function renderViewerContent(f){const b=$('#vbody');
+  if(f.is_image) b.innerHTML=`<img class="viewer-img" src="/api/raw?path=${encodeURIComponent(f.path)}" alt="">`;
+  else if(f.is_renderable){b.innerHTML=`<div class="view-toggle"><button class="active" data-m="render">Rendered</button><button data-m="source">Source</button></div><div id="vcontent"></div>`;
+    const set=m=>{$$('.view-toggle button').forEach(x=>x.classList.toggle('active',x.dataset.m===m));
+      if(m==='render')$('#vcontent').innerHTML=`<iframe class="render-iframe" sandbox="allow-same-origin" srcdoc="${esc(f.content||'')}"></iframe>`;
+      else $('#vcontent').innerHTML=`<pre class="code">${highlightCode(f.content||'',f.ext)}</pre>`;};
+    $$('.view-toggle button').forEach(x=>x.onclick=()=>set(x.dataset.m)); set('render');}
+  else if(f.is_text){if(f.ext==='.md'||f.ext==='.markdown') b.innerHTML=`<div class="md-body">${renderMarkdown(f.content||'')}</div>`; else b.innerHTML=`<pre class="code">${highlightCode(f.content||'',f.ext)}</pre>`;}
+  else b.innerHTML=infoBox('Preview not available',`This <b>${esc(f.ext||'file')}</b> can't be rendered in-browser. Use the folder icon to locate it.`,true);
+}
+function navViewer(d){if(viewIndex<0)return;const ni=viewIndex+d;if(ni<0||ni>=currentResults.length){toast(d<0?'First file':'Last file');return;}openViewer(ni);}
+function renderMarkdown(md){let h=esc(md);
+  h=h.replace(/```([\s\S]*?)```/g,(m,c)=>`<pre><code>${c.replace(/^\n/,'')}</code></pre>`);
+  h=h.replace(/^######\s?(.*)$/gm,'<h6>$1</h6>').replace(/^#####\s?(.*)$/gm,'<h5>$1</h5>').replace(/^####\s?(.*)$/gm,'<h4>$1</h4>').replace(/^###\s?(.*)$/gm,'<h3>$1</h3>').replace(/^##\s?(.*)$/gm,'<h2>$1</h2>').replace(/^#\s?(.*)$/gm,'<h1>$1</h1>');
+  h=h.replace(/^>\s?(.*)$/gm,'<blockquote>$1</blockquote>');
+  h=h.replace(/^\s*[-*]\s+(.*)$/gm,'<li>$1</li>'); h=h.replace(/(<li>[\s\S]*?<\/li>)/g,'<ul>$1</ul>').replace(/<\/ul>\s*<ul>/g,'');
+  h=h.replace(/^(?!<)(\d+)\.\s+(.*)$/gm,'<li>$2</li>'); h=h.replace(/^---$/gm,'<hr>');
+  h=h.replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>').replace(/\*([^*]+)\*/g,'<em>$1</em>').replace(/`([^`]+)`/g,'<code>$1</code>');
+  h=h.replace(/\[([^\]]+)\]\(([^)]+)\)/g,'<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  h=h.replace(/\n{2,}/g,'</p><p>').replace(/^(?!<)/,'<p>').replace(/([^>])$/,'$1</p>'); return h;}
+function highlightCode(code,ext){let h=esc(code);
+  const kw={'.js':/(\bconst\b|\blet\b|\bvar\b|\bfunction\b|\breturn\b|\bif\b|\belse\b|\bfor\b|\bwhile\b|\bclass\b|\bnew\b|\bimport\b|\bfrom\b|\bexport\b|\basync\b|\bawait\b|\btrue\b|\bfalse\b|\bnull\b|\bundefined\b)/g,'.jsx':/(\bconst\b|\blet\b|\bfunction\b|\breturn\b|\bimport\b|\bfrom\b|\bexport\b|\bdefault\b|\bclass\b|\bextends\b|\brender\b|\btrue\b|\bfalse\b|\bnull\b)/g,'.ts':/(\bconst\b|\blet\b|\binterface\b|\btype\b|\bfunction\b|\breturn\b|\bimport\b|\bexport\b|\bclass\b|\bpublic\b|\bprivate\b|\bnew\b|\basync\b|\bawait\b)/g,'.py':/(\bdef\b|\bclass\b|\bimport\b|\bfrom\b|\breturn\b|\bif\b|\belif\b|\belse\b|\bfor\b|\bwhile\b|\btry\b|\bexcept\b|\bwith\b|\bas\b|\blambda\b|\bself\b|\bNone\b|\bTrue\b|\bFalse\b|\basync\b|\bawait\b|\byield\b)/g,'.java':/(\bpublic\b|\bprivate\b|\bprotected\b|\bclass\b|\binterface\b|\bvoid\b|\bint\b|\bString\b|\breturn\b|\bnew\b|\bif\b|\belse\b|\bfor\b|\bwhile\b|\bimport\b|\bpackage\b|\bstatic\b|\bfinal\b|\bextends\b|\bimplements\b)/g};
+  const store=[];
+  h=h.replace(/(\/\*[\s\S]*?\*\/|\/\/[^\n]*|#[^\n]*)/g,m=>{store.push('<span class="com">'+m+'</span>');return`\x00${store.length-1}\x00`;});
+  h=h.replace(/(`(?:\\.|[^`\\])*`|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')/g,m=>{store.push('<span class="str">'+m+'</span>');return`\x00${store.length-1}\x00`;});
+  if(ext==='.html'||ext==='.htm')h=h.replace(/(&lt;\/?[a-zA-Z][\w-]*)/g,'<span class="tag-name">$1</span>');
+  if(kw[ext])h=h.replace(kw[ext],'<span class="kw">$1</span>');
+  h=h.replace(/\b(\d+(\.\d+)?)\b/g,'<span class="num">$1</span>'); h=h.replace(/\x00(\d+)\x00/g,(m,n)=>store[n]); return h;}
+
+/* ---------- folder picker (with filter + sizes) ---------- */
+function openPicker(initial){$('#pickerOverlay').classList.add('show');browse(initial||'');}
+function paintPickGrid(){
+  const f=$('#pickFilter').value.trim().toLowerCase();
+  const g=$('#pickGrid');
+  const list=pickerDirs.filter(d=>!f||d.name.toLowerCase().includes(f));
+  if(!list.length){g.innerHTML='<div style="padding:20px;color:var(--text-tertiary);text-align:center">No matching folders</div>';return;}
+  g.innerHTML=list.map(dd=>`<div class="pick-item" data-p="${esc(dd.path)}">${KIND_ICON.folder}<span class="pn">${esc(dd.name)}</span><span class="psize" data-sizeof="${esc(dd.path)}">…</span><span class="choose">Open ›</span></div>`).join('');
+  $$('.pick-item').forEach(it=>it.onclick=()=>browse(it.dataset.p));
+  // lazy sizes
+  const paths=[...new Set(list.map(d=>d.path))].slice(0,40).join('|');
+  if(paths) API('/api/folder_sizes?'+new URLSearchParams({paths})).then(map=>{
+    Object.entries(map).forEach(([p,info])=>{const el=$(`.psize[data-sizeof="${CSS.escape(p)}"]`); if(el)el.textContent=info.size_h;});
+  }).catch(()=>{});
+}
+async function browse(path){
+  pickerCurrent=path;
+  try{
+    const d=await API('/api/browse?'+new URLSearchParams({path}));
+    let crumb='<a data-p="">Drives</a>';
+    if(d.current){const parts=d.current.replace(/\\/g,'/').split('/').filter(Boolean);let acc='';
+      parts.forEach((p,idx)=>{acc+=(idx?'/':'')+p;const full=(d.current.includes(':')&&idx===0)?p+':/':acc;crumb+=`<span class="sep">›</span><a data-p="${esc(full)}">${esc(p)}</a>`;});}
+    $('#pickCrumb').innerHTML=crumb; $$('#pickCrumb a').forEach(a=>a.onclick=()=>browse(a.dataset.p));
+    pickerDirs=d.dirs;
+    if(!pickerDirs.length){$('#pickGrid').innerHTML='<div style="padding:20px;color:var(--text-tertiary);text-align:center">No sub-folders (or access denied)</div>';return;}
+    paintPickGrid();
+    $('#pickHere').onclick=()=>chooseFolder(d.current);
+  }catch(e){$('#pickGrid').innerHTML='<div style="padding:20px;color:var(--accent-coral)">Could not read this location.</div>';}
+}
+function chooseFolder(path){
+  scopeFolder=path;
+  $('#scopeHolder').innerHTML=`<span class="scope-chip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" style="width:14px;height:14px"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg><span class="spath" title="${esc(path)}">${esc(path)}</span><button class="clear"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M6 6l12 12M18 6L6 18"/></svg></button></span>`;
+  $('#scopeHolder .clear').onclick=()=>{scopeFolder=null;$('#scopeHolder').innerHTML='';};
+  $('#pickerOverlay').classList.remove('show'); toast('Scoped to '+path);
+}
+
+/* ---------- native Browse (system dialog, Chrome/Edge) ---------- */
+async function nativeBrowse(){
+  if(!window.showDirectoryPicker){toast('System picker needs Chrome/Edge — using Folder browser');openPicker('');return;}
+  try{
+    const handle=await window.showDirectoryPicker();
+    // Browser security hides the absolute path; we do an instant client-side
+    // search over the picked folder (no index needed).
+    const files=[]; let n=0;
+    async function walk(dir,prefix){
+      for await(const [name,entry] of dir.entries()){
+        if(n>60000)break;
+        try{
+          if(entry.kind==='directory') await walk(entry,(prefix?prefix+'/':'')+name);
+          else{const f=await entry.getFile(); files.push({name,rel:(prefix?prefix+'/':'')+name,size:f.size,handle:f}); n++;}
+        }catch(_){}
+      }
+    }
+    $('#resultsArea').dataset.filled='1';
+    $('#resultsArea').innerHTML=loadingBox('Reading '+handle.name+' …');
+    await walk(handle,'');
+    hasSearched=true; $('#statsBanner').style.display='none';
+    renderLiveFolder(handle.name,files);
+  }catch(e){ if(e&&e.name!=='AbortError') toast('Browse cancelled or blocked'); }
+}
+function renderLiveFolder(name,files){
+  const total=files.reduce((a,f)=>a+f.size,0);
+  let html=`<div class="results-head"><h2>Live folder: ${esc(name)} <span class="count">· ${files.length.toLocaleString()} files · ${humanSizeJS(total)}</span></h2><span class="count">picked via system dialog · client-side</span></div>
+    <div class="pick-search" style="margin-bottom:12px"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg><input id="liveFilter" placeholder="Filter files in ${esc(name)}…"></div>
+    <div class="result-list" id="liveList"></div>`;
+  $('#resultsArea').innerHTML=html;
+  const paint=(q)=>{const ql=q.toLowerCase();const list=files.filter(f=>!q||f.name.toLowerCase().includes(ql)).slice(0,1500);
+    $('#liveList').innerHTML=list.map(f=>`<div class="row"><div class="ic" style="color:var(--kind-code)">${kindIcon('other')}</div><div class="meta"><div class="fname">${esc(f.name)}</div><div class="fpath">${esc(f.rel)}</div></div><span class="fsize">${humanSizeJS(f.size)}</span></div>`).join('')||'<div class="state-box"><p>No files match.</p></div>';};
+  paint(''); $('#liveFilter').oninput=e=>paint(e.target.value);
+}
+function humanSizeJS(n){if(!n)return '0 B';const u=['B','KB','MB','GB','TB','PB'];let i=Math.floor(Math.log(Math.max(n,1))/Math.log(1024));i=Math.min(i,u.length-1);let s=n/1024**i;return (s>=100?s.toFixed(0):s>=10?s.toFixed(1):s.toFixed(2))+' '+u[i];}
+
+/* ---------- indexing ---------- */
+async function startIndex(){
+  const root=await pickRoot(); if(!root)return;
+  await API('/api/index',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({root})});
+  toast('Indexing started — may take a while for large drives'); refreshStatus();
+}
+function pickRoot(){return new Promise(res=>{openPicker('');$('#pickClose').onclick=()=>{$('#pickerOverlay').classList.remove('show');res('');};$('#pickHere').onclick=()=>{chooseFolder(pickerCurrent);res(pickerCurrent);};});}
+
+/* ---------- OCR ---------- */
+function addMsg(role,html){const c=document.createElement('div');c.className='chat-msg '+(role==='user'?'user':'bot');c.innerHTML=`<div class="bubble">${html}</div>`;$('#chatBody').appendChild(c);$('#chatBody').scrollTop=$('#chatBody').scrollHeight;return c;}
+async function handleImages(files){
+  if(!files||!files.length)return;const imgs=[...files].filter(f=>f.type.startsWith('image/'));if(!imgs.length){toast('Please drop an image');return;}
+  addMsg('user',`Looking at ${imgs.length} image${imgs.length>1?'s':''}…${imgs.map(f=>`<img src="${URL.createObjectURL(f)}">`).join('')}`);
+  addMsg('bot','<div class="spinner" style="width:22px;height:22px;border-width:2.5px"></div>');
+  const fd=new FormData(); imgs.forEach(f=>fd.append('images',f));
+  try{const r=await fetch('/api/ocr',{method:'POST',body:fd}).then(r=>r.json());const m=$('#chatBody').lastChild;
+    if(!r.available){m.querySelector('.bubble').innerHTML=esc(r.message);return;}
+    if(!r.text.trim()){m.querySelector('.bubble').innerHTML='No text detected. Try a clearer photo or type the name above.';return;}
+    let s=r.suggestions.queries.length?'<div class="sugg-grid">'+r.suggestions.queries.map(q=>`<button class="sugg" data-q="${esc(q)}">${esc(q)}</button>`).join('')+'</div>':'';
+    if(r.suggestions.extensions.length)s+='<div class="sugg-grid" style="margin-top:8px">'+r.suggestions.extensions.slice(0,6).map(e=>`<button class="sugg" data-ext="${esc(e)}">${esc(e)} files</button>`).join('')+'</div>';
+    m.querySelector('.bubble').innerHTML=`Found text:<div class="ocr-text">${esc(r.text.slice(0,1200))}</div><div style="margin-top:10px;font-size:11.5px;color:var(--text-tertiary)">Tap to search:</div>${s||'<div style="margin-top:8px;font-size:12px">No clear hints.</div>'}`;
+    $$('.sugg[data-q]').forEach(b=>b.onclick=()=>{$('#searchInput').value=b.dataset.q;$('#chatPanel').classList.remove('show');doSearch();});
+    $$('.sugg[data-ext]').forEach(b=>b.onclick=()=>{$('#searchInput').value=b.dataset.ext;$('#chatPanel').classList.remove('show');doSearch();});
+  }catch(e){$('#chatBody').lastChild.querySelector('.bubble').innerHTML='OCR failed: '+esc(e.error||e);}
+}
+
+/* ---------- wiring ---------- */
+function init(){
+  initTheme();
+  $('#btnSearch').onclick=doSearch;
+  $('#searchInput').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();doSearch();}});
+  $('#searchInput').addEventListener('input',e=>{e.target.style.height='auto';e.target.style.height=Math.min(e.target.scrollHeight,120)+'px';runSearch();});
+  $('#sortSelect').onchange=runSearch;
+  $('#typeChips').addEventListener('click',e=>{const c=e.target.closest('.chip');if(!c)return;
+    if(activeType===c.dataset.type){c.classList.remove('active');activeType=null;}else{$$('.chip').forEach(x=>x.classList.remove('active'));c.classList.add('active');activeType=c.dataset.type;}runSearch();});
+  $('#btnScope').onclick=()=>openPicker('');
+  $('#btnBrowse').onclick=nativeBrowse;
+  $('#btnIndex').onclick=startIndex;
+  $('#btnTheme').onclick=()=>{const d=document.documentElement.getAttribute('data-theme')==='dark'?'light':'dark';document.documentElement.setAttribute('data-theme',d);localStorage.setItem('fr-theme',d);paintThemeIcon();};
+
+  $('#vClose').onclick=()=>$('#viewerOverlay').classList.remove('show');
+  $('#navPrev').onclick=()=>navViewer(-1); $('#navNext').onclick=()=>navViewer(1);
+  $('#vReveal').onclick=()=>{if(viewIndex>=0)revealPath(currentResults[viewIndex].path);};
+  $('#vCopy').onclick=()=>{if(viewIndex>=0)copyText(currentResults[viewIndex].path);};
+
+  $('#pickClose').onclick=()=>$('#pickerOverlay').classList.remove('show');
+  $('#pickFilter').addEventListener('input',paintPickGrid);
+  // Paste a path in the picker's search bar → jump to it (Enter) or live-search it.
+  $('#pickFilter').addEventListener('keydown',e=>{
+    if(e.key==='Enter'){
+      const v=e.target.value.trim();
+      if(!v)return;
+      if(looksLikePath(v)){
+        // Navigate the picker into the pasted folder.
+        e.preventDefault(); browse(v.replace(/^["']|["']$/g,''));
+        e.target.value='';
+      } else {
+        // Not a path → scope to the current folder and run a name search.
+        e.preventDefault();
+        if(pickerCurrent){ chooseFolder(pickerCurrent); $('#searchInput').value=v; doSearch(); }
+      }
+    }
+  });
+  $('#viewerOverlay').addEventListener('mousedown',e=>{if(e.target.id==='viewerOverlay')$('#viewerOverlay').classList.remove('show');});
+  $('#pickerOverlay').addEventListener('mousedown',e=>{if(e.target.id==='pickerOverlay')$('#pickerOverlay').classList.remove('show');});
+
+  // keyboard: Esc closes; Ctrl+K & any letter focuses search
+  document.addEventListener('keydown',e=>{
+    if(e.key==='Escape'){$('#viewerOverlay').classList.remove('show');$('#pickerOverlay').classList.remove('show');$('#chatPanel').classList.remove('show');}
+    if($('#viewerOverlay').classList.contains('show')){if(e.key==='ArrowLeft'){e.preventDefault();navViewer(-1);}if(e.key==='ArrowRight'){e.preventDefault();navViewer(1);}}
+    const inField=/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)||e.target.isContentEditable;
+    const typing=$('#searchInput')===document.activeElement;
+    if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='k'){e.preventDefault();$('#searchInput').focus();$('#searchInput').select();return;}
+    if(inField||typing)return;
+    if(e.key.length===1&&/[a-zA-Z0-9.]/.test(e.key)){$('#searchInput').focus();}
+  });
+
+  $('#fabOCR').onclick=()=>$('#chatPanel').classList.toggle('show');
+  $('#chatClose').onclick=()=>$('#chatPanel').classList.remove('show');
+  $('#dropzone').onclick=()=>$('#fileInput').click();
+  $('#fileInput').onchange=e=>handleImages(e.target.files);
+  $('#dropzone').addEventListener('dragover',e=>{e.preventDefault();$('#dropzone').classList.add('drag');});
+  $('#dropzone').addEventListener('dragleave',()=>$('#dropzone').classList.remove('drag'));
+  $('#dropzone').addEventListener('drop',e=>{e.preventDefault();$('#dropzone').classList.remove('drag');handleImages(e.dataTransfer.files);});
+  document.addEventListener('paste',e=>{if(!$('#chatPanel').classList.contains('show'))return;const imgs=[...(e.clipboardData?.items||[])].filter(i=>i.type.startsWith('image/')).map(i=>i.getAsFile()).filter(Boolean);if(imgs.length)handleImages(imgs);});
+
+  refreshStatus();
+}
+init();
+</script>
+</body>
+</html>
+
+
+
+=== FILE: app.py ===
+"""
+FileReach — Flask API server + static UI host.
+
+Run with:  python app.py        Then open: http://127.0.0.1:8765
+
+Observability:
+  * Every search / index / OCR is logged to BOTH the console (pretty, with elapsed
+    time and result counts) and to the log file in the user data dir.
+  * A version banner prints on startup.
+  * When the index returns nothing but a folder is in scope, the UI automatically
+    falls back to a live (no-index) filesystem walk.
+
+Security posture:
+  * READ-ONLY re: your files (opens 'rb'/'r' only). Binds to 127.0.0.1 only.
+  * Same-Origin enforcement blocks CSRF / drive-by requests.
+  * The only writes are this app's own index DB + log in the user data dir.
+"""
+
+import os
+import sys
+import io
+import re
+import time
+import platform
+import threading
+import traceback
+from datetime import datetime
+
+from flask import Flask, request, jsonify, send_from_directory, abort, g
+
+from engine import (
+    Indexer, SearchEngine, list_drives, list_dirs, reveal_in_explorer,
+    read_file_text, TYPE_CATEGORIES, TEXT_VIEWABLE, IMAGE_VIEWABLE,
+    RENDERABLE_HTML, human_size, human_date, human_date_short, is_windows,
+    disk_info, folder_size, live_search, looks_like_path, VERSION,
+)
+
+PORT = int(os.environ.get("FILEREACH_PORT", "8765"))
+
+# --------------------------------------------------------------------------- #
+#  Paths — frozen-aware so PyInstaller builds locate the bundled UI.
+# --------------------------------------------------------------------------- #
+if getattr(sys, "frozen", False):
+    BUNDLE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+else:
+    BUNDLE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = os.path.join(BUNDLE_DIR, "static")
+
+if is_windows():
+    _base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    DATA_DIR = os.path.join(_base, "FileReach")
+else:
+    DATA_DIR = os.path.join(os.path.expanduser("~"), ".filereach")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+DB_PATH = os.path.join(DATA_DIR, "index.db")
+LOG_PATH = os.path.join(DATA_DIR, "filereach.log")
+
+# --------------------------------------------------------------------------- #
+#  Structured logger — console (pretty) + file (durable)
+# --------------------------------------------------------------------------- #
+# Minimal ANSI colours; harmless on terminals that don't support them.
+_C = {
+    "RST": "\033[0m", "DIM": "\033[2m", "B": "\033[1m",
+    "GRN": "\033[32m", "YEL": "\033[33m", "RED": "\033[31m",
+    "CYN": "\033[36m", "GRY": "\033[90m", "MAG": "\033[35m",
+}
+
+
+class AppLog:
+    """Thread-safe logger that prints to the console AND appends to a file."""
+
+    def __init__(self, path, version):
+        self.path = path
+        self.version = version
+        self._lock = threading.Lock()
+
+    def _ts(self):
+        return datetime.now().strftime("%H:%M:%S")
+
+    def _write(self, level, msg, color, console=True):
+        line = f"[{self._ts()}] [{level:<5}] {msg}"
+        with self._lock:
+            if console:
+                cline = f"{color}{line}{_C['RST']}"
+                try:
+                    print(cline, flush=True)
+                except Exception:
+                    print(line, flush=True)
+            try:
+                with open(self.path, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+            except Exception:
+                pass
+
+    def info(self, m):    self._write("INFO", m, _C["CYN"])
+    def ok(self, m):     self._write("OK", m, _C["GRN"])
+    def warn(self, m):   self._write("WARN", m, _C["YEL"])
+    def error(self, m):  self._write("ERROR", m, _C["RED"])
+    def dim(self, m):    self._write("DIM", m, _C["GRY"], console=True)
+
+    def banner(self, lines):
+        bar = "═" * 58
+        with self._lock:
+            for i, ln in enumerate(lines):
+                color = _C["B"] if i == 0 or i == len(lines) - 1 else _C["CYN"]
+                print(f"{color}{ln}{_C['RST']}", flush=True)
+            try:
+                with open(self.path, "a", encoding="utf-8") as f:
+                    f.write("\n" + bar + "\n" + "\n".join(lines) + "\n" + bar + "\n")
+            except Exception:
+                pass
+
+
+log = AppLog(LOG_PATH, VERSION)
+
+
+def log_exception(where, exc):
+    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)[:4])
+    log.error(f"{where}: {exc}\n{tb}")
+
+
+# --------------------------------------------------------------------------- #
+#  OCR (Tesseract) — optional, graceful fallback
+# --------------------------------------------------------------------------- #
+OCR = {"available": False, "pytesseract": None, "path": None}
+
+
+def init_ocr():
+    try:
+        import pytesseract  # type: ignore
+        candidates = []
+        if is_windows():
+            pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+            pf86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+            for base in (pf, pf86):
+                tdir = os.path.join(base, "Tesseract-OCR")
+                if os.path.isdir(tdir) and os.path.isfile(os.path.join(tdir, "tesseract.exe")):
+                    candidates.append(os.path.join(tdir, "tesseract.exe"))
+        chosen = candidates[0] if candidates else None
+        if chosen:
+            pytesseract.pytesseract.tesseract_cmd = chosen
+        ver = pytesseract.get_tesseract_version()
+        OCR.update({"available": True, "pytesseract": pytesseract, "path": chosen})
+        log.ok(f"OCR ready — Tesseract {ver}" + (f" @ {chosen}" if chosen else " (PATH)"))
+    except Exception as e:
+        log.warn(f"OCR unavailable: {e}  (image→text feature disabled; core search works)")
+        OCR["available"] = False
+
+
+# --------------------------------------------------------------------------- #
+#  App + singletons
+# --------------------------------------------------------------------------- #
+app = Flask(__name__, static_folder=None)
+app.config["JSON_SORT_KEYS"] = False
+app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024
+
+indexer = Indexer(DB_PATH)
+indexer.connect()
+search = SearchEngine(indexer.conn)
+
+_indexed_before = search.count_all()
+
+
+def json_error(msg, code=400):
+    return jsonify({"error": msg}), code
+
+
+# --------------------------------------------------------------------------- #
+#  Same-Origin enforcement (CSRF guard)
+# --------------------------------------------------------------------------- #
+@app.before_request
+def _enforce_same_origin():
+    if request.path.startswith("/api/"):
+        origin = request.headers.get("Origin") or request.headers.get("Referer")
+        if origin:
+            host = request.headers.get("Host")
+            if host:
+                ok = False
+                for scheme in ("http://", "https://"):
+                    if origin.startswith(scheme + host):
+                        ok = True
+                        break
+                    rest = origin[len(scheme):]
+                    if rest.startswith(host + "/") or rest == host:
+                        ok = True
+                        break
+                if not ok:
+                    log.warn(f"Blocked cross-origin request from {origin}")
+                    return jsonify({"error": "cross-origin request blocked"}), 403
+    g.req_start = time.time()
+
+
+@app.after_request
+def _access_log(resp):
+    try:
+        if request.path.startswith("/api/") and request.method == "GET":
+            ms = int((time.time() - getattr(g, "req_start", time.time())) * 1000)
+            # concise request line
+            q = request.args.get("q")
+            ext = request.args.get("ext")
+            ftype = request.args.get("type")
+            folder = request.args.get("folder")
+            parts = []
+            if q: parts.append(f"q={q!r}")
+            if ext: parts.append(f"ext={ext}")
+            if ftype: parts.append(f"type={ftype}")
+            if folder: parts.append(f"folder={folder}")
+            detail = (" " + " ".join(parts)) if parts else ""
+            # body is JSON; pull count if present for search/live endpoints
+            count = ""
+            try:
+                if request.path in ("/api/search", "/api/live_search") and resp.is_json:
+                    count = f" → {resp.get_json().get('count', '?')} hits"
+            except Exception:
+                pass
+            log.dim(f"{request.method} {request.path}{detail} {resp.status_code} {ms}ms{count}")
+    except Exception:
+        pass
+    return resp
+
+
+# --------------------------------------------------------------------------- #
+#  API
+# --------------------------------------------------------------------------- #
+@app.route("/")
+def index():
+    return send_from_directory(STATIC_DIR, "index.html")
+
+
+@app.route("/api/version")
+def api_version():
+    return jsonify({
+        "version": VERSION,
+        "platform": platform.system(),
+        "python": platform.python_version(),
+        "data_dir": DATA_DIR,
+        "log_path": LOG_PATH,
+        "ocr_available": OCR["available"],
+        "fuzzy_used": True,
+    })
+
+
+@app.route("/api/status")
+def api_status():
+    st = indexer.get_status()
+    st["version"] = VERSION
+    st["ocr_available"] = OCR["available"]
+    st["ocr_path"] = OCR["path"]
+    st["platform"] = platform.system()
+    st["log_path"] = LOG_PATH
+    rows = indexer.conn.execute(
+        "SELECT root, COUNT(*) n FROM files GROUP BY root ORDER BY root"
+    ).fetchall()
+    st["indexed_roots"] = [dict(r) for r in rows]
+    return jsonify(st)
+
+
+@app.route("/api/index", methods=["POST"])
+def api_index():
+    if indexer.is_busy():
+        log.warn("Index rejected — already indexing")
+        return json_error("Already indexing — cancel the current run first", 409)
+    data = request.get_json(silent=True) or {}
+    root = (data.get("root") or "").strip()
+    incremental = data.get("incremental", True)
+    if not root:
+        return json_error("Missing 'root' path")
+    if not os.path.exists(root):
+        log.error(f"Index request for missing path: {root}")
+        return json_error(f"Path not found: {root}")
+    log.info(f"Index started: {root} (incremental={bool(incremental)})")
+    ok = indexer.index(root, incremental=bool(incremental))
+    return jsonify({"started": ok, "status": indexer.get_status()})
+
+
+@app.route("/api/cancel", methods=["POST"])
+def api_cancel():
+    indexer.cancel()
+    log.warn("Index cancel requested")
+    return jsonify({"ok": True})
+
+
+@app.route("/api/search")
+def api_search():
+    q = request.args.get("q", "").strip()
+    ext = request.args.get("ext", "").strip()
+    ftype = request.args.get("type", "").strip().lower()
+    folder = request.args.get("folder", "").strip()
+    sort = request.args.get("sort", "relevance")
+    try:
+        limit = min(int(request.args.get("limit", 1000)), 5000)
+    except (TypeError, ValueError):
+        limit = 1000
+    if not (q or ext or ftype):
+        return json_error("Provide a query, extension, or type")
+
+    res = search.search(
+        query=q or None, ext=ext or None, ftype=ftype or None,
+        folder=folder or None, sort=sort, limit=limit,
+    )
+
+    # Tell the UI whether the scope is indexed, so it can decide on a live fallback.
+    indexed_scope = True if not folder else indexer.is_indexed(folder)
+    if not indexed_scope:
+        log.warn(f"Scope '{folder}' is NOT under an indexed root — UI may live-search.")
+
+    for r in res["results"]:
+        r["size_h"] = human_size(r["size"])
+        r["created_h"] = human_date_short(r["created"])
+        r["modified_h"] = human_date_short(r["modified"])
+        r["is_viewable_text"] = (r["ext"] or "") in TEXT_VIEWABLE
+        r["is_image"] = (r["ext"] or "") in IMAGE_VIEWABLE
+        r["is_renderable"] = (r["ext"] or "") in RENDERABLE_HTML
+
+    res["scope_indexed"] = indexed_scope
+    return jsonify(res)
+
+
+@app.route("/api/live_search")
+def api_live():
+    """Live (no-index) walk. Used for pasted paths and as a fallback."""
+    path = request.args.get("path", "").strip()
+    q = request.args.get("q", "").strip()
+    ext = request.args.get("ext", "").strip()
+    ftype = request.args.get("type", "").strip().lower()
+    try:
+        limit = min(int(request.args.get("limit", 1500)), 5000)
+    except (TypeError, ValueError):
+        limit = 1500
+    if not path:
+        return json_error("Missing 'path'")
+    if not os.path.isdir(path):
+        return json_error(f"Not a folder: {path}")
+    log.info(f"LIVE search: {path}  q={q!r} ext={ext} type={ftype}")
+    res = live_search(path, query=q or None, ext=ext or None,
+                      ftype=ftype or None, limit=limit, timeout=25.0)
+    for r in res["results"]:
+        r["is_viewable_text"] = (r["ext"] or "") in TEXT_VIEWABLE
+        r["is_image"] = (r["ext"] or "") in IMAGE_VIEWABLE
+        r["is_renderable"] = (r["ext"] or "") in RENDERABLE_HTML
+    tag = ""
+    if res["timed_out"]:
+        tag = " (timed out — partial)"
+        log.warn(f"Live search timed out at {res.get('elapsed')}s, scanned {res['scanned']}")
+    elif res["truncated"]:
+        tag = " (capped)"
+    log.ok(f"Live search done: {res['count']} hits, scanned {res['scanned']} "
+           f"in {res.get('elapsed')}s{tag}")
+    return jsonify(res)
+
+
+@app.route("/api/stats")
+def api_stats():
+    ext = request.args.get("ext", "").strip()
+    ftype = request.args.get("type", "").strip().lower()
+    folder = request.args.get("folder", "").strip()
+    if not (ext or ftype):
+        return json_error("Provide an extension or type")
+    st = search.stats(ext=ext or None, ftype=ftype or None, folder=folder or None)
+    return jsonify(st)
+
+
+@app.route("/api/overview")
+def api_overview():
+    return jsonify(search.overview())
+
+
+@app.route("/api/drives")
+def api_drives():
+    return jsonify({"drives": list_drives()})
+
+
+@app.route("/api/browse")
+def api_browse():
+    path = request.args.get("path", "")
+    dirs, real = list_dirs(path)
+    parent = ""
+    if real and real not in ("/", ""):
+        p = os.path.dirname(real)
+        if p and p != real:
+            parent = p
+    return jsonify({"current": real, "parent": parent, "dirs": dirs})
+
+
+@app.route("/api/reveal", methods=["POST"])
+def api_reveal():
+    data = request.get_json(silent=True) or {}
+    path = (data.get("path") or "").strip()
+    if not path or not os.path.exists(path):
+        return json_error("Invalid path")
+    try:
+        reveal_in_explorer(path)
+        log.dim(f"Reveal: {path}")
+        return jsonify({"ok": True})
+    except Exception as e:
+        log_exception("reveal", e)
+        return json_error(str(e), 500)
+
+
+@app.route("/api/file")
+def api_file():
+    path = request.args.get("path", "").strip()
+    if not path:
+        return json_error("Missing path")
+    if not os.path.exists(path):
+        return json_error("File not found", 404)
+    try:
+        st = os.stat(path)
+    except OSError as e:
+        log_exception("stat", e)
+        return json_error(str(e), 500)
+    ext = os.path.splitext(path)[1].lower()
+    meta = {
+        "path": os.path.abspath(path), "name": os.path.basename(path), "ext": ext,
+        "size": st.st_size, "size_h": human_size(st.st_size),
+        "created": st.st_ctime, "modified": st.st_mtime,
+        "created_h": human_date(st.st_ctime), "modified_h": human_date(st.st_mtime),
+        "is_image": ext in IMAGE_VIEWABLE, "is_text": ext in TEXT_VIEWABLE,
+        "is_renderable": ext in RENDERABLE_HTML, "content": None,
+    }
+    if ext in TEXT_VIEWABLE and st.st_size < 5_000_000:
+        text, _ = read_file_text(path, limit=2_000_000)
+        meta["content"] = text
+    return jsonify(meta)
+
+
+@app.route("/api/raw")
+def api_raw():
+    path = request.args.get("path", "").strip()
+    if not path or not os.path.exists(path):
+        abort(404)
+    ext = os.path.splitext(path)[1].lower().lstrip(".")
+    mime = {
+        "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+        "gif": "image/gif", "bmp": "image/bmp", "webp": "image/webp",
+        "svg": "image/svg+xml", "ico": "image/x-icon",
+    }.get(ext, "application/octet-stream")
+    try:
+        directory, fname = os.path.split(os.path.abspath(path))
+        return send_from_directory(directory, fname, mimetype=mime)
+    except Exception:
+        abort(404)
+
+
+@app.route("/api/ocr", methods=["POST"])
+def api_ocr():
+    if not OCR["available"]:
+        return jsonify({
+            "available": False,
+            "message": ("OCR is not installed. Install Tesseract (one-time): "
+                        "https://github.com/UB-Mannheim/tesseract/wiki then restart FileReach."),
+        }), 200
+    files = request.files.getlist("images")
+    if not files:
+        return json_error("No images uploaded")
+    from PIL import Image  # type: ignore
+    Image.MAX_IMAGE_PIXELS = max(Image.MAX_IMAGE_PIXELS or 0, 89_000_000)
+    pytesseract = OCR["pytesseract"]
+    full_text, pages = [], []
+    for f in files:
+        try:
+            f.stream.seek(0)
+            img = Image.open(io.BytesIO(f.read()))
+            img.load()
+            text = pytesseract.image_to_string(img).strip()
+            full_text.append(text)
+            pages.append({"name": f.filename, "text": text})
+        except Image.DecompressionBombError:
+            pages.append({"name": f.filename, "error": "image too large (bomb guard)"})
+        except Exception as e:
+            pages.append({"name": f.filename, "error": str(e)})
+    combined = "\n\n".join(t for t in full_text if t).strip()
+    log.ok(f"OCR: {len(files)} image(s) → {len(combined)} chars of text")
+    return jsonify({
+        "available": True, "text": combined, "pages": pages,
+        "suggestions": extract_search_hints(combined),
+    })
+
+
+def extract_search_hints(text):
+    if not text:
+        return {"names": [], "extensions": [], "dates": [], "queries": []}
+    all_ext_sets = list(TYPE_CATEGORIES.values())
+    exts = sorted(set(re.findall(r"\.([a-zA-Z0-9]{2,5})\b", text.lower())))
+    exts = [e for e in exts
+            if any(("." + e) in s for s in all_ext_sets)
+            or e in ("pdf", "txt", "md", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+                     "csv", "mp3", "mp4", "mkv", "zip", "rar", "7z", "exe", "psd", "ai")]
+    date_pats = [r"\b(\d{4}-\d{1,2}-\d{1,2})\b",
+                 r"\b(\d{1,2}[/.]\d{1,2}[/.]\d{2,4})\b",
+                 r"\b(\d{1,2}-\d{1,2}-\d{2,4})\b"]
+    dates = sorted({d for p in date_pats for d in re.findall(p, text)})
+    tokens = re.findall(r"[A-Za-z][A-Za-z0-9_\-]{2,}", text)
+    stop = {"the", "and", "for", "with", "this", "that", "from", "have", "your", "you",
+            "are", "was", "were", "but", "not", "all", "can", "will", "been", "into",
+            "they", "them", "their", "there", "here", "when", "where", "which", "what",
+            "who", "how", "why", "date", "time", "name", "file", "document", "page",
+            "image", "photo", "picture"}
+    counts = {}
+    for t in tokens:
+        if t.lower() in stop:
+            continue
+        counts[t.lower()] = counts.get(t.lower(), 0) + 1
+    names = sorted(counts, key=lambda k: (counts[k], len(k)), reverse=True)[:8]
+    return {"names": names, "extensions": ["." + e for e in exts], "dates": dates,
+            "queries": list(names[:5])}
+
+
+@app.route("/api/types")
+def api_types():
+    return jsonify({
+        "categories": {k: sorted(v) for k, v in TYPE_CATEGORIES.items()},
+        "viewable_text": sorted(TEXT_VIEWABLE),
+        "images": sorted(IMAGE_VIEWABLE),
+        "renderable": sorted(RENDERABLE_HTML),
+    })
+
+
+@app.route("/api/disk")
+def api_disk():
+    return jsonify({"disks": disk_info()})
+
+
+@app.route("/api/folder_sizes")
+def api_folder_sizes():
+    raw = request.args.get("paths", "")
+    paths = [p for p in raw.split("|") if p and os.path.isdir(p)]
+    return jsonify({p: folder_size(p) for p in paths})
+
+
+@app.errorhandler(404)
+def _h404(e):
+    return jsonify({"error": "not found", "path": request.path}), 404
+
+
+@app.errorhandler(500)
+def _h500(e):
+    log_exception(f"500 on {request.path}", e)
+    return jsonify({"error": "internal error", "detail": str(e)}), 500
+
+
+# --------------------------------------------------------------------------- #
+#  Entrypoint
+# --------------------------------------------------------------------------- #
+def main():
+    init_ocr()
+    log.banner([
+        "",
+        "  ╔══════════════════════════════════════════════════╗",
+        "  ║          FileReach  ·  read-only search           ║",
+       f"  ║          version {VERSION:<34}     ║",
+        "  ╚══════════════════════════════════════════════════╝",
+        "",
+        f"  Platform     : {platform.system()} {platform.release()}",
+        f"  Python       : {platform.python_version()}",
+        f"  Data folder  : {DATA_DIR}",
+        f"  Log file     : {LOG_PATH}",
+        f"  Index DB     : {DB_PATH}  ({_indexed_before:,} files already indexed)",
+        f"  OCR          : {'ready (Tesseract)' if OCR['available'] else 'not installed — image→text disabled'}",
+        f"  Fuzzy match  : {'rapidfuzz' if True else 'difflib'}",
+        f"  Web UI       : http://127.0.0.1:{PORT}",
+        "",
+        "  Tip: paste a path like  C:\\Users\\iassh\\Documents  in the search box",
+        "       to search that folder directly (works even without an index).",
+        "",
+    ])
+    try:
+        import webbrowser
+        threading.Timer(1.2, lambda: webbrowser.open(f"http://127.0.0.1:{PORT}")).start()
+    except Exception:
+        pass
+    try:
+        # disable Flask's own noisy logger so our pretty one is the single source.
+        import logging
+        logging.getLogger("werkzeug").setLevel(logging.ERROR)
+        app.run(host="127.0.0.1", port=PORT, debug=False, threaded=True)
+    except KeyboardInterrupt:
+        log.warn("Stopped by user (Ctrl+C)")
+    except Exception as e:
+        log_exception("server", e)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+=== FILE: CHANGELOG.md ===
+# Changelog
+
+All notable changes to FileReach are documented here.
+Format loosely based on [Keep a Changelog](https://keepachangelog.com/).
+
+## [v1.2.0] — 2026-06-30 — *Logging, live search & path paste*
+
+This release targets "the app shows nothing" reports: the root cause was folders that
+weren't indexed. Searching them now works **without an index**, via a live filesystem
+walk. Every action is also logged to the console so you can see exactly what happened.
+
+### Fixed
+- **"Won't show anything" bug:** if a scoped folder isn't under an indexed root, the
+  search now **auto-falls back to a live walk** of that folder and returns real matches.
+  (Previously returned 0 because the folder simply wasn't indexed.)
+- Extension + type-chip conflict no longer silently empties results (extension wins).
+
+### Added
+- **Structured logging** — a version banner on startup, and a concise coloured line for
+  every search/index/OCR/reveal with elapsed time and hit counts. Mirrored to the log
+  file (`%LOCALAPPDATA%\FileReach\filereach.log`). You can read what happened / what
+  failed straight from the terminal — no need to screenshot.
+- **Path paste in the search bar** — paste `C:\Users\iassh\OneDrive\Documents` (with or
+  without a trailing query) to search that folder directly. Also works in the folder
+  picker's search bar (Enter to jump in).
+- **Live (no-index) search** — new `/api/live_search`, time-boxed (25s) and capped.
+- **Version + status** — new `/api/version`; status shows version, platform, log path.
+- Extension searches are not "classified" as a type; results show their category tag so
+  you can see where files fall.
+
+## [v1.1.0] — 2026-06-30 — *Features & UX*
+
+### Fixed
+- **Critical UX bug:** typing an extension (e.g. `.md`) while a Type chip was active
+  returned zero results (extension + category were ANDed). An explicit extension now
+  overrides the type filter.
+- **Repeated searches:** typing/clicking no longer fires a burst of identical requests;
+  search is debounced (300 ms) with in-flight request deduplication.
+
+### Added
+- **Dark mode** — warm-charcoal theme that keeps the Linen palette; toggle in the top bar,
+  persists across sessions, respects OS `prefers-color-scheme` on first run.
+- **Idle disk overview** — the home screen now shows total/used/free capacity per drive.
+- **System folder picker (Browse)** — opens the native OS folder dialog (Chrome/Edge) and
+  runs an instant client-side search over the picked folder; no index needed. Falls back
+  to the in-app browser elsewhere.
+- **In-picker search** — filter folders by name while browsing.
+- **Folder sizes** — real recursive size + file count shown next to each folder (lazy, cached).
+- **Autofocus** — pressing any letter/digit/`.` focuses the search box; **Ctrl+K** too.
+- New endpoints: `/api/disk`, `/api/folder_sizes`.
+- **FEATURES.md** — a complete feature guide.
+
+## [v1.0.1] — 2026-06-30 — *Security & packaging hotfix*
+
+Remediates the issues in the [Security Audit 2026-06-30](docs/SECURITY_AUDIT_2026-06-30.md).
+**The `v1.0.0` binaries are superseded — please use `v1.0.1`.**
+
+### Fixed
+- **Critical:** frozen-path resolution now uses `sys._MEIPASS`, so packaged
+  Windows/macOS/Linux binaries correctly locate the bundled UI (v1.0.0 builds were
+  fragile/blank).
+- **High:** added Same-Origin enforcement — cross-origin (CSRF / drive-by) requests to the
+  local API are now rejected with `403`.
+- **High:** SQLite `busy_timeout=6000` plus an `is_busy()` re-entry guard (`409` on a
+  second concurrent index) to eliminate "database is locked" races.
+- **Medium:** `?limit=` now tolerates non-numeric input instead of returning HTTP 500.
+- **Medium:** `api_status` rewritten (removed dead `search_roots()` reference).
+- **Medium:** OCR now explicitly guards against Pillow decompression bombs.
+- **Medium:** fixed broken extension detection in OCR hint extraction.
+- **Low:** removed unused imports / dead variables (`pyflakes` is now clean).
+- Added `.gitattributes` to normalise line endings (LF in repo, CRLF for `.bat`).
+
+## [v1.0.0] — 2026-06-30 — *Initial release*
+
+- Read-only, local-first file search for large drives (475 GB+).
+- SQLite (WAL) index, `os.scandir` walk, fuzzy relevance ranking.
+- Linen-style UI: multi-name search, extension/type filters, folder scope, sorting.
+- Per-extension stats: count, total size, first/last created.
+- Read-only viewer: Markdown, HTML (sandboxed), syntax-highlighted code, images;
+  ←/→ navigation.
+- OCR-driven search from pasted photos (optional, via Tesseract).
+- Single-UAC Windows launcher; cross-platform PyInstaller CI builds → Releases.
+
+
+
+=== FILE: CONTRIBUTING.md ===
+# Contributing to FileReach
+
+Thanks for your interest in improving FileReach! A few ground rules keep the
+project trustworthy.
+
+## The non-negotiables
+
+These rules exist to protect users' data. PRs that violate them won't be merged.
+
+1. **Read-only.** Never introduce code that writes to, moves, renames, or deletes a
+   user's file. Files must be opened with `'rb'` / `'r'` only. The only writes allowed
+   are to FileReach's own data dir (`%LOCALAPPDATA%\FileReach` / `~/.filereach`).
+2. **No duplication.** Don't copy file bytes anywhere — not to temp, not to a cache.
+   Read metadata and (for the viewer) content on demand.
+3. **Single permission.** The app asks for Administrator exactly once (source: `run.py`;
+   Windows build: the embedded `requireAdministrator` manifest). No per-folder prompts.
+
+## Development setup
+
+```bash
+git clone <repo>
+cd filereach
+python3 -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+python app.py                    # opens http://127.0.0.1:8765
+```
+
+## Before opening a PR
+
+- `python -c "import engine, app"` should succeed with no errors.
+- If you change search behaviour, sanity-check with a small test folder:
+  ```bash
+  python -c "import sys; sys.path.insert(0,'.'); import engine, app; print('ok')"
+  ```
+- Keep the UI consistent with the Linen design tokens (CSS variables in
+  `static/index.html`). No external CDNs/fonts beyond the bundled Inter link — the
+  in-app preview is sandboxed with no network access.
+
+## Building
+
+```bash
+pip install pyinstaller
+python make_icon.py
+pyinstaller filereach.spec --noconfirm
+```
+
+## Commit style
+
+Small, focused commits with a clear message (e.g. `feat: add .epub to documents`,
+`fix: handle long paths on Windows`). conventional-commits style is appreciated.
+
+## Reporting issues
+
+Include: OS, whether you ran the binary or source, the relevant log lines from
+`%LOCALAPPDATA%\FileReach\filereach.log` (or `~/.filereach/filereach.log`), and the
+exact steps to reproduce.
+
+
+
+=== FILE: engine.py ===
+"""
+FileReach engine — read-only filesystem indexer, search, and live search.
+
+Design rules:
+  * NEVER delete any file.    -> no os.remove / shutil.rmtree anywhere.
+  * NEVER duplicate any file. -> file bytes are never copied; only metadata/content read.
+  * Read-only access.         -> files opened with mode 'rb' / 'r' only.
+  * As fast as possible.      -> os.scandir walk + SQLite (WAL) index, indexed columns,
+                                 in-memory fuzzy scoring, background incremental re-index,
+                                 plus a live (no-index) search fallback.
+
+Core search has zero external dependencies. `rapidfuzz` is optional (faster fuzzy
+matching); `difflib` is the stdlib fallback.
+"""
+
+import os
+import re
+import math
+import time
+import sqlite3
+import threading
+import platform
+import shutil
+import subprocess
+from datetime import datetime
+
+VERSION = "1.2.0"
+
+# ----------------------------------------------------------------------------- #
+#  File-type categories
+#
+#  Overlap note: "spreadsheets"/"presentations" intentionally overlap "documents".
+#  _kind_for() classifies by the FIRST match (documents), so the `kind` column is
+#  one of: images, videos, audio, documents, code, archives, fonts, other, folder.
+# ----------------------------------------------------------------------------- #
+TYPE_CATEGORIES = {
+    "images": {
+        ".jpg", ".jpeg", ".jpe", ".png", ".gif", ".bmp", ".webp",
+        ".tiff", ".tif", ".svg", ".heic", ".heif", ".raw", ".cr2", ".cr3",
+        ".nef", ".arw", ".dng", ".orf", ".rw2", ".ico", ".psd", ".ai", ".jp2",
+    },
+    "videos": {
+        ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v",
+        ".mpg", ".mpeg", ".mpe", ".3gp", ".3g2", ".ts", ".vob", ".ogv", ".rm", ".rmvb",
+    },
+    "audio": {
+        ".mp3", ".wav", ".flac", ".aac", ".ogg", ".oga", ".m4a", ".wma",
+        ".opus", ".aiff", ".aif", ".alac", ".amr", ".mid", ".midi",
+    },
+    "documents": {
+        ".pdf", ".doc", ".docx", ".txt", ".md", ".markdown", ".rtf", ".odt",
+        ".xls", ".xlsx", ".ppt", ".pptx", ".csv", ".epub", ".pages", ".numbers",
+        ".key", ".odp", ".ods", ".tex", ".mobi", ".azw", ".azw3",
+    },
+    "code": {
+        ".py", ".js", ".jsx", ".ts", ".tsx", ".html", ".htm", ".css", ".scss",
+        ".sass", ".less", ".java", ".c", ".h", ".cpp", ".hpp", ".cc", ".cs",
+        ".rb", ".go", ".rs", ".php", ".swift", ".kt", ".kts", ".scala", ".clj",
+        ".sql", ".json", ".xml", ".yaml", ".yml", ".toml", ".ini", ".cfg",
+        ".conf", ".sh", ".bash", ".zsh", ".bat", ".ps1", ".vue", ".svelte",
+        ".dart", ".lua", ".r", ".pl", ".vim", ".gradle", ".makefile", ".asm",
+    },
+    "archives": {
+        ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".iso", ".tgz",
+        ".tbz2", ".lz", ".cab", ".dmg",
+    },
+    "fonts": {".ttf", ".otf", ".woff", ".woff2", ".eot"},
+    "spreadsheets": {".xls", ".xlsx", ".ods", ".csv", ".numbers"},
+    "presentations": {".ppt", ".pptx", ".odp", ".key"},
+}
+
+TEXT_VIEWABLE = {
+    ".txt", ".md", ".markdown", ".log", ".csv", ".tsv", ".json", ".xml",
+    ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".properties",
+    ".py", ".js", ".jsx", ".ts", ".tsx", ".html", ".htm", ".css", ".scss",
+    ".sass", ".less", ".java", ".c", ".h", ".cpp", ".hpp", ".cc", ".cs",
+    ".rb", ".go", ".rs", ".php", ".swift", ".kt", ".sql", ".sh", ".bash",
+    ".zsh", ".bat", ".ps1", ".vue", ".svelte", ".dart", ".lua", ".r", ".pl",
+    ".svg", ".gitignore", ".env", ".dockerfile", ".makefile",
+}
+
+IMAGE_VIEWABLE = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".svg", ".ico"}
+RENDERABLE_HTML = {".html", ".htm"}
+
+# ----------------------------------------------------------------------------- #
+#  Optional fuzzy matching
+# ----------------------------------------------------------------------------- #
+try:
+    from rapidfuzz import fuzz as _rf_fuzz
+    _HAS_RAPIDFUZZ = True
+    def _score(a, b):
+        return _rf_fuzz.token_sort_ratio(a, b)
+except Exception:
+    import difflib
+    _HAS_RAPIDFUZZ = False
+    def _score(a, b):
+        return difflib.SequenceMatcher(None, a, b).ratio() * 100.0
+
+
+# ----------------------------------------------------------------------------- #
+#  Helpers
+# ----------------------------------------------------------------------------- #
+def human_size(n):
+    if n is None:
+        return "0 B"
+    n = float(n)
+    if n < 0:
+        return "0 B"
+    units = ["B", "KB", "MB", "GB", "TB", "PB", "EB"]
+    i = int(math.floor(math.log(max(n, 1), 1024)))
+    i = min(i, len(units) - 1)
+    s = n / (1024 ** i)
+    if s >= 100:
+        return f"{s:.0f} {units[i]}"
+    if s >= 10:
+        return f"{s:.1f} {units[i]}"
+    return f"{s:.2f} {units[i]}"
+
+
+def human_date(ts):
+    if not ts:
+        return "—"
+    try:
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+    except (OSError, ValueError, OverflowError):
+        return "—"
+
+
+def human_date_short(ts):
+    if not ts:
+        return "—"
+    try:
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+    except (OSError, ValueError, OverflowError):
+        return "—"
+
+
+def is_windows():
+    return platform.system() == "Windows"
+
+
+def long_path(path):
+    """Enable access to very long paths (>260 chars) on Windows."""
+    if is_windows():
+        abs_path = os.path.abspath(path)
+        if abs_path.startswith("\\\\?\\"):
+            return abs_path
+        return "\\\\?\\" + abs_path
+    return path
+
+
+def looks_like_path(s):
+    """True if `s` looks like a host path the user pasted (Win/Unix/UNC/home)."""
+    if not s:
+        return False
+    s = s.strip().strip('"').strip("'")
+    if re.match(r"^[A-Za-z]:[\\/]", s):      # C:\... or C:/...
+        return True
+    if s.startswith("\\\\"):                  # UNC \\server\share
+        return True
+    if s.startswith("/") or s.startswith("~/") or s == "~":
+        return True
+    return False
+
+
+# ----------------------------------------------------------------------------- #
+#  Indexer
+# ----------------------------------------------------------------------------- #
+class Indexer:
+    """Walks the filesystem and stores metadata in SQLite. Background-capable."""
+
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.lock = threading.RLock()
+        self.conn = None
+        self.status = {
+            "state": "idle", "root": None, "indexed": 0, "dirs": 0, "errors": 0,
+            "started_at": 0, "finished_at": 0, "current": "", "message": "",
+        }
+        self._stop = threading.Event()
+
+    def connect(self):
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute("PRAGMA temp_store=MEMORY")
+        self.conn.execute("PRAGMA busy_timeout=6000")
+        self._init_schema()
+        return self.conn
+
+    def _init_schema(self):
+        c = self.conn
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT UNIQUE, name TEXT, name_lower TEXT, ext TEXT,
+                size INTEGER, created REAL, modified REAL, is_dir INTEGER,
+                root TEXT, kind TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_name_lower ON files(name_lower);
+            CREATE INDEX IF NOT EXISTS idx_ext ON files(ext);
+            CREATE INDEX IF NOT EXISTS idx_kind ON files(kind);
+            CREATE INDEX IF NOT EXISTS idx_isdir ON files(is_dir);
+            CREATE INDEX IF NOT EXISTS idx_modified ON files(modified);
+            CREATE INDEX IF NOT EXISTS idx_created ON files(created);
+            """
+        )
+        c.commit()
+
+    def _kind_for(self, ext):
+        for kind, exts in TYPE_CATEGORIES.items():
+            if ext in exts:
+                return kind
+        return "other"
+
+    def is_busy(self):
+        with self.lock:
+            return self.status["state"] == "indexing"
+
+    def is_indexed(self, path):
+        """Is `path` (or a parent of it) covered by an existing index root?"""
+        if not path:
+            return False
+        try:
+            norm = os.path.abspath(path).replace("\\", "/").rstrip("/").lower()
+            rows = self.conn.execute("SELECT DISTINCT root FROM files").fetchall()
+            for r in rows:
+                root = (r["root"] or "").replace("\\", "/").rstrip("/").lower()
+                if not root:
+                    continue
+                if norm == root or norm.startswith(root + "/"):
+                    return True
+            return False
+        except Exception:
+            return False
+
+    def get_status(self):
+        with self.lock:
+            d = dict(self.status)
+        if d["state"] in ("done", "cancelled", "error") and d["finished_at"]:
+            d["elapsed"] = round(d["finished_at"] - d["started_at"], 1)
+        elif d["state"] == "indexing":
+            d["elapsed"] = round(time.time() - d["started_at"], 1)
+        try:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS n, COALESCE(SUM(size),0) AS s FROM files WHERE is_dir=0"
+            ).fetchone()
+            d["total_files"] = row["n"]
+            d["total_size"] = row["s"]
+            d["total_size_h"] = human_size(row["s"])
+        except Exception:
+            d["total_files"] = 0
+            d["total_size"] = 0
+            d["total_size_h"] = "0 B"
+        return d
+
+    def _walk(self, root):
+        norm_root = os.path.abspath(root)
+        stack = [norm_root]
+        while stack and not self._stop.is_set():
+            current = stack.pop()
+            try:
+                with os.scandir(current) as it:
+                    children = list(it)
+            except (OSError, PermissionError):
+                with self.lock:
+                    self.status["errors"] += 1
+                continue
+            for entry in children:
+                if self._stop.is_set():
+                    break
+                try:
+                    is_dir = entry.is_dir(follow_symlinks=False)
+                    if is_dir:
+                        st = entry.stat(follow_symlinks=False)
+                        yield (entry.path, entry.name, entry.name.lower(), "",
+                               0, st.st_ctime, st.st_mtime, 1, norm_root, "folder")
+                        stack.append(entry.path)
+                        with self.lock:
+                            self.status["dirs"] += 1
+                    elif entry.is_file(follow_symlinks=False):
+                        st = entry.stat(follow_symlinks=False)
+                        ext = os.path.splitext(entry.name)[1].lower()
+                        kind = self._kind_for(ext)
+                        yield (entry.path, entry.name, entry.name.lower(), ext,
+                               st.st_size, st.st_ctime, st.st_mtime, 0, norm_root, kind)
+                        with self.lock:
+                            self.status["indexed"] += 1
+                            if self.status["indexed"] % 250 == 0:
+                                self.status["current"] = entry.path
+                except (OSError, PermissionError):
+                    with self.lock:
+                        self.status["errors"] += 1
+                    continue
+
+    def index(self, root, incremental=True):
+        root = os.path.abspath(root)
+        if not os.path.exists(root):
+            self.status["message"] = f"Path not found: {root}"
+            return False
+        self._stop.clear()
+        with self.lock:
+            self.status.update({
+                "state": "indexing", "root": root, "indexed": 0, "dirs": 0, "errors": 0,
+                "started_at": time.time(), "finished_at": 0, "current": root,
+                "message": "Indexing…",
+            })
+
+        def _run():
+            try:
+                BATCH = 5000
+                buf = []
+                with self.conn:
+                    if incremental:
+                        self.conn.execute("DELETE FROM files WHERE root = ?", (root,))
+                    sql = ("INSERT OR REPLACE INTO files "
+                           "(path,name,name_lower,ext,size,created,modified,is_dir,root,kind) "
+                           "VALUES (?,?,?,?,?,?,?,?,?,?)")
+                    cur = self.conn.cursor()
+                    for row in self._walk(root):
+                        buf.append(row)
+                        if len(buf) >= BATCH:
+                            cur.executemany(sql, buf)
+                            self.conn.commit()
+                            buf.clear()
+                    if buf:
+                        cur.executemany(sql, buf)
+                        self.conn.commit()
+                with self.lock:
+                    if self._stop.is_set():
+                        self.status["state"] = "cancelled"
+                        self.status["message"] = "Indexing cancelled."
+                    else:
+                        self.status["state"] = "done"
+                        self.status["message"] = "Index complete."
+                    self.status["finished_at"] = time.time()
+                    self.status["current"] = ""
+            except Exception as e:
+                with self.lock:
+                    self.status["state"] = "error"
+                    self.status["message"] = f"Error: {e}"
+                    self.status["finished_at"] = time.time()
+
+        threading.Thread(target=_run, daemon=True, name="fr-index").start()
+        return True
+
+    def cancel(self):
+        self._stop.set()
+
+
+# ----------------------------------------------------------------------------- #
+#  Relevance ranking (shared by index search + live search)
+# ----------------------------------------------------------------------------- #
+def rank_results(results, terms):
+    """Score each result by best fuzzy match against query terms; sort desc."""
+    joined = " ".join(terms).lower()
+    for r in results:
+        name_l = r["name"].lower()
+        base = _score(joined, name_l)
+        best_term = 0.0
+        for t in terms:
+            tl = t.lower()
+            if tl in name_l:
+                best_term = max(best_term, 95.0 if name_l.startswith(tl) else 80.0)
+        r["_score"] = round(max(base, best_term), 1)
+    results.sort(key=lambda r: (-r["_score"], r["name"].lower()))
+    return results
+
+
+# ----------------------------------------------------------------------------- #
+#  Search engine (over the index)
+# ----------------------------------------------------------------------------- #
+class SearchEngine:
+    def __init__(self, conn):
+        self.conn = conn
+
+    def _build(self, query=None, ext=None, ftype=None, folder=None, folders_only=False):
+        where = ["is_dir = 1"] if folders_only else ["is_dir = 0"]
+        params = []
+        if not folders_only and ext:
+            e = ext.strip().lower()
+            if not e.startswith("."):
+                e = "." + e
+            where.append("ext = ?")
+            params.append(e)
+        if not folders_only and ftype and ftype in TYPE_CATEGORIES:
+            exts = sorted(TYPE_CATEGORIES[ftype])
+            ph = ",".join("?" * len(exts))
+            where.append(f"ext IN ({ph})")
+            params.extend(exts)
+        if folder:
+            f = os.path.abspath(folder).replace("\\", "/")
+            where.append("(replace(path,'\\','/') = ? OR replace(path,'\\','/') LIKE ?)")
+            params.extend([f, f.rstrip("/") + "/%"])
+        name_terms = []
+        if query:
+            parts = re.split(r"[\n,;]+", query)
+            name_terms = [p.strip() for p in parts if p.strip()]
+        if name_terms:
+            ors = []
+            for t in name_terms:
+                tl = t.lower()
+                ors.append("(name_lower LIKE ? OR path LIKE ?)")
+                params.extend([f"%{tl}%", f"%{tl}%"])
+            where.append("(" + " OR ".join(ors) + ")")
+        return " AND ".join(where), params, name_terms
+
+    def search(self, query=None, ext=None, ftype=None, folder=None,
+               sort="relevance", limit=1000, include_folders=False):
+        where, params, name_terms = self._build(
+            query, ext, ftype, folder, folders_only=bool(include_folders)
+        )
+        order = self._order_for(sort, has_query=bool(name_terms))
+        sql = (f"SELECT path,name,ext,size,created,modified,kind FROM files "
+               f"WHERE {where} ORDER BY {order} LIMIT ?")
+        rows = self.conn.execute(sql, list(params) + [int(limit)]).fetchall()
+        results = [dict(r) for r in rows]
+        if name_terms and query:
+            results = rank_results(results, name_terms)
+        return {
+            "results": results, "count": len(results), "query": query, "ext": ext,
+            "ftype": ftype, "folder": folder, "sort": sort, "fuzzy_used": _HAS_RAPIDFUZZ,
+            "source": "index",
+        }
+
+    def _order_for(self, sort, has_query):
+        m = {
+            "name-asc": "name COLLATE NOCASE ASC", "name-desc": "name COLLATE NOCASE DESC",
+            "size-desc": "size DESC", "size-asc": "size ASC",
+            "modified-desc": "modified DESC", "modified-asc": "modified ASC",
+            "created-desc": "created DESC", "created-asc": "created ASC",
+            "relevance": "name COLLATE NOCASE ASC",
+        }
+        return m.get(sort, m["name-asc"])
+
+    def stats(self, ext=None, ftype=None, folder=None):
+        where, params, _ = self._build(ext=ext, ftype=ftype, folder=folder)
+        row = self.conn.execute(
+            f"SELECT COUNT(*) n, COALESCE(SUM(size),0) s, "
+            f"MIN(created) mn, MAX(created) mx FROM files WHERE {where}",
+            params,
+        ).fetchone()
+        n, s, mn, mx = row["n"], row["s"], row["mn"], row["mx"]
+        return {
+            "count": n, "total_size": s, "total_size_h": human_size(s),
+            "first_created": mn, "first_created_h": human_date(mn),
+            "last_created": mx, "last_created_h": human_date(mx),
+        }
+
+    def overview(self):
+        rows = self.conn.execute(
+            "SELECT ext, COUNT(*) n, COALESCE(SUM(size),0) s FROM files "
+            "WHERE is_dir=0 GROUP BY ext ORDER BY n DESC LIMIT 40"
+        ).fetchall()
+        kind_rows = self.conn.execute(
+            "SELECT kind, COUNT(*) n, COALESCE(SUM(size),0) s FROM files "
+            "WHERE is_dir=0 GROUP BY kind ORDER BY n DESC"
+        ).fetchall()
+        return {
+            "extensions": [
+                {"ext": r["ext"] or "(none)", "count": r["n"], "size_h": human_size(r["s"])}
+                for r in rows
+            ],
+            "kinds": [
+                {"kind": r["kind"], "count": r["n"], "size_h": human_size(r["s"])}
+                for r in kind_rows
+            ],
+        }
+
+    def indexed_roots(self):
+        rows = self.conn.execute(
+            "SELECT root, COUNT(*) n FROM files GROUP BY root ORDER BY root"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def count_all(self):
+        return self.conn.execute("SELECT COUNT(*) n FROM files").fetchone()["n"]
+
+
+# ----------------------------------------------------------------------------- #
+#  Live search — no index needed. Walks a path on demand (read-only),
+#  time-boxed + capped. Used when a folder isn't indexed or a raw path is pasted.
+# ----------------------------------------------------------------------------- #
+def live_search(path, query=None, ext=None, ftype=None, limit=1500, timeout=25.0):
+    path = os.path.abspath(path)
+    started = time.time()
+    if not os.path.isdir(path):
+        return {"results": [], "count": 0, "scanned": 0, "truncated": False,
+                "timed_out": False, "path": path, "source": "live",
+                "note": "not a directory"}
+
+    terms = []
+    if query:
+        terms = [t.strip().lower() for t in re.split(r"[\n,;]+", query) if t.strip()]
+    if ext:
+        ext = ext.strip().lower()
+        if not ext.startswith("."):
+            ext = "." + ext
+    allowed_exts = TYPE_CATEGORIES[ftype] if (ftype and ftype in TYPE_CATEGORIES) else None
+
+    results = []
+    scanned = 0
+    truncated = False
+    timed_out = False
+    stack = [path]
+
+    while stack:
+        if time.time() - started > timeout:
+            timed_out = True
+            break
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                children = list(it)
+        except (OSError, PermissionError):
+            continue
+        for entry in children:
+            if len(results) >= limit:
+                truncated = True
+                break
+            if scanned and scanned % 4000 == 0 and time.time() - started > timeout:
+                timed_out = True
+                break
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append(entry.path)
+                elif entry.is_file(follow_symlinks=False):
+                    scanned += 1
+                    name = entry.name
+                    name_l = name.lower()
+                    e = os.path.splitext(name)[1].lower()
+                    if ext and e != ext:
+                        continue
+                    if allowed_exts is not None and e not in allowed_exts:
+                        continue
+                    if terms and not any(t in name_l or t in entry.path.lower() for t in terms):
+                        continue
+                    st = entry.stat(follow_symlinks=False)
+                    results.append({
+                        "path": entry.path, "name": name, "ext": e, "size": st.st_size,
+                        "created": st.st_ctime, "modified": st.st_mtime,
+                        "kind": _kind_for_static(e),
+                        "size_h": human_size(st.st_size),
+                        "created_h": human_date_short(st.st_ctime),
+                        "modified_h": human_date_short(st.st_mtime),
+                        "is_image": e in IMAGE_VIEWABLE,
+                        "is_viewable_text": e in TEXT_VIEWABLE,
+                        "is_renderable": e in RENDERABLE_HTML,
+                    })
+            except (OSError, PermissionError):
+                continue
+        if truncated or timed_out:
+            break
+
+    if terms and results:
+        results = rank_results(results, terms)
+
+    return {
+        "results": results, "count": len(results), "scanned": scanned,
+        "truncated": truncated, "timed_out": timed_out, "path": path,
+        "source": "live", "elapsed": round(time.time() - started, 2),
+    }
+
+
+def _kind_for_static(ext):
+    for kind, exts in TYPE_CATEGORIES.items():
+        if ext in exts:
+            return kind
+    return "other"
+
+
+# --------------------------------------------------------------------------- #
+#  Filesystem browse / reveal / read helpers (read-only)
+# --------------------------------------------------------------------------- #
+def list_drives():
+    if is_windows():
+        import string
+        drives = []
+        for letter in string.ascii_uppercase:
+            d = f"{letter}:\\"
+            if os.path.exists(d):
+                drives.append(d)
+        return drives or ["C:\\"]
+    return ["/"]
+
+
+def list_dirs(path):
+    if not path or path in ("/", ""):
+        if is_windows():
+            return [{"name": d, "path": d} for d in list_drives()], ""
+        path = "/"
+    try:
+        out = []
+        with os.scandir(path) as it:
+            for entry in it:
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        out.append({"name": entry.name, "path": entry.path})
+                except (OSError, PermissionError):
+                    continue
+        out.sort(key=lambda d: d["name"].lower())
+        return out, os.path.abspath(path)
+    except (OSError, PermissionError):
+        return [], os.path.abspath(path)
+
+
+def reveal_in_explorer(path):
+    path = os.path.abspath(path)
+    if is_windows():
+        subprocess.Popen(["explorer", "/select,", path])
+        return True
+    if platform.system() == "Darwin":
+        subprocess.Popen(["open", "-R", path])
+        return True
+    subprocess.Popen(["xdg-open", os.path.dirname(path) or path])
+    return True
+
+
+def read_file_text(path, limit=512_000):
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            data = f.read(limit)
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            try:
+                text = data.decode("latin-1")
+            except Exception:
+                text = data.decode("utf-8", errors="replace")
+        return text, size
+    except (OSError, PermissionError):
+        return None, 0
+
+
+# --------------------------------------------------------------------------- #
+#  Disk usage + folder sizes (read-only)
+# --------------------------------------------------------------------------- #
+_FOLDER_SIZE_CACHE = {}
+
+
+def disk_info():
+    out = []
+    for d in list_drives():
+        try:
+            u = shutil.disk_usage(d)
+            out.append({
+                "drive": d, "total": u.total, "used": u.used, "free": u.free,
+                "total_h": human_size(u.total), "used_h": human_size(u.used),
+                "free_h": human_size(u.free),
+                "percent": round(u.used / u.total * 100, 1) if u.total else 0,
+            })
+        except (OSError, PermissionError, ValueError):
+            continue
+    return out
+
+
+def folder_size(path, ttl=120):
+    key = os.path.abspath(path)
+    now = time.time()
+    c = _FOLDER_SIZE_CACHE.get(key)
+    if c and now - c[1] < ttl:
+        return {"size": c[0], "files": c[2], "size_h": human_size(c[0]), "cached": True}
+    total, nfiles = 0, 0
+    try:
+        for root, _dirs, files in os.walk(key):
+            for f in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, f))
+                    nfiles += 1
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    _FOLDER_SIZE_CACHE[key] = (total, now, nfiles)
+    return {"size": total, "files": nfiles, "size_h": human_size(total), "cached": False}
+
+
+
+=== FILE: FEATURES.md ===
+# FileReach — Feature Guide
+
+A practical reference for **every feature in FileReach, what it does, and how to use it.**
+For install/build steps, see the [README](README.md). For security posture, see the
+[Audit](docs/SECURITY_AUDIT_2026-06-30.md).
+
+---
+
+## Search
+
+| Feature | What it does | How to use |
+|---|---|---|
+| **Name search** | Matches file/folder names anywhere (case-insensitive), fuzzy-ranked. | Type a name, press **Enter**. Paste several at once. |
+| **Paste a path** | Searches a host folder directly — **works even if it's not indexed.** | Paste e.g. `C:\Users\iassh\OneDrive\Documents` (optionally followed by a query). |
+| **Live fallback** | If a scoped folder isn't indexed, FileReach walks it live so you still get results. | Automatic. |
+| **Extension search** | All files of an extension; shows count, total size, first/last created. Not "typed" — it overrides the type chip. | Type `.pdf`, `.mp4`… |
+| **Type chips** | Filter by category. When an extension is typed, the chip is ignored and each result shows its category tag instead. | Click a chip. |
+| **Folder scope** | Restrict to one folder. | **Folder** → browse → pick, or paste the path. |
+| **Debounced** | Rapid typing collapses into one request. | Automatic (300 ms). |
+
+### Sorting
+Best match · Name A→Z / Z→A · Newest/oldest modified or created · Largest/smallest.
+
+---
+
+## Logs & feedback (read the terminal — no screenshots needed)
+
+When you run FileReach, the terminal/console shows:
+
+- A **version banner** (version, platform, Python, data folder, log path, OCR status).
+- A coloured line per action, e.g. `LIVE search: C:\Users\... q='3'` →
+  `Live search done: 3 hits, scanned 4 in 0.0s`.
+- `WARN` when a scope isn't indexed (so you know why results may be live), and when a
+  cross-origin request is blocked.
+- `ERROR` with a traceback on failures.
+
+Everything is also written to `%LOCALAPPDATA%\FileReach\filereach.log`
+(macOS/Linux: `~/.filereach/filereach.log`). Open it with any text editor.
+
+---
+
+## Keyboard & focus
+
+| Shortcut | Action |
+|---|---|
+| **Ctrl + K** (or ⌘K) | Focus the search box. |
+| **Any letter / digit / `.`** | Auto-focuses the search box when you're not already typing somewhere. |
+| **Enter** | Search now (bypasses debounce). |
+| **← / →** | Previous / next file in the viewer. |
+| **Esc** | Close viewer / folder picker / OCR panel. |
+
+---
+
+## Result actions
+
+Each result shows name, full path, size, and date.
+- 👁️ **View** — open the read-only viewer (when previewable).
+- 📁 **path icon** — reveal the file **selected** in File Explorer / Finder.
+- 📋 **copy icon** — copy the full path to the clipboard.
+
+---
+
+## Viewer (read-only — never edits files)
+
+| File type | Behaviour |
+|---|---|
+| **Markdown** (`.md`) | Rendered (headings, lists, code, links with `rel="noopener"`). |
+| **HTML** (`.html`) | Rendered live in a **sandboxed** iframe (scripts off for safety), or switch to **Source**. |
+| **Code** (`.py .js .jsx .ts .css .java …`) | Syntax-highlighted. |
+| **Images** (`.png .jpg .gif .svg …`) | Displayed inline. |
+
+Navigate the result list with **← / →**; the viewer shows position (e.g. `3 / 120`).
+
+---
+
+## Folders & browsing
+
+| Feature | What it does |
+|---|---|
+| **Browse button** (topbar) | Opens the **system folder dialog** (Chrome/Edge `showDirectoryPicker`) and runs an instant **client-side** search over the picked folder — **no index needed**. Falls back to the in-app browser on Firefox/Safari. |
+| **Folder button** (topbar) | In-app drive/folder browser to set a search scope. |
+| **In-picker search** | Filter folders by name while browsing. |
+| **Folder sizes** | Real recursive size + file count shown next to each folder (loads lazily, cached). |
+| **Breadcrumbs** | Click any segment to jump up the path. |
+
+> **Browse limitation:** browsers intentionally hide the absolute path of folders picked via the system dialog. Files from a **Browse**-picked folder are listed/sized client-side; use **Reveal** (works for indexed results) or the **Folder** browser when you need the real path.
+
+---
+
+## Idle state
+
+When you haven't searched yet, the home screen shows **disk usage** for every drive —
+total capacity, used, free, and a fill bar — so you see your storage at a glance.
+
+---
+
+## Dark mode
+
+A proper warm-charcoal dark theme that keeps the Linen palette and accents.
+- Toggle with the **sun/moon** button in the top bar.
+- Remembers your choice (and respects your OS `prefers-color-scheme` on first run).
+
+---
+
+## Indexing & speed
+
+- **Re-index** → pick a drive/folder → FileReach walks it with `os.scandir` (fastest method)
+  and stores metadata in **SQLite (WAL)**.
+- After indexing, searches are SQLite queries → **milliseconds**.
+- **Incremental**: re-indexing a root refreshes only it; sizes/dates update in place
+  (`INSERT OR REPLACE`).
+- Live progress in the header (`Indexing… 1,204,330 files`).
+
+---
+
+## Image → Search (OCR, optional)
+
+- Open the side panel with the **purple button** (bottom-right).
+- **Drop, paste, or upload** a photo of a document/screenshot.
+- FileReach extracts the text (Tesseract) and offers **one-click smart searches**
+  (detected names, extensions, dates).
+- Activates automatically once Tesseract is installed; the app runs fine without it.
+
+**Install Tesseract (one-time):**
+- Windows: <https://github.com/UB-Mannheim/tesseract/wiki>
+- macOS: `brew install tesseract` · Linux: `sudo apt install tesseract-ocr`
+
+---
+
+## The four hard rules (still sacred)
+
+1. **Never delete** a file — no destructive calls anywhere in the source.
+2. **Never duplicate** a file — file bytes are never copied.
+3. **Read-only** — files opened `'rb'`/`'r'` only.
+4. **One permission** — single Administrator prompt (`run.py` / Windows manifest).
+
+
+
+=== FILE: filereach.spec ===
+# -*- mode: python ; coding: utf-8 -*-
+"""
+PyInstaller spec for FileReach — cross-platform (Windows / macOS / Linux).
+
+Build with:   pyinstaller filereach.spec --noconfirm
+Produces:     dist/FileReach/  (a portable one-folder distribution)
+
+Notes:
+  * The UI (static/) is bundled via datas and located at runtime via sys._MEIPASS.
+  * On Windows, uac_admin=True embeds a manifest that requests Administrator on
+    launch — that is the SINGLE permission prompt the user ever sees.
+  * Optional deps (rapidfuzz, pytesseract) are listed as hidden imports so they
+    bundle when present; if absent at runtime the engine falls back gracefully.
+"""
+import os
+
+block_cipher = None
+
+# Optional per-platform icon (generated by make_icon.py in CI / locally)
+icon_path = None
+if os.path.exists("assets/icon.ico") and os.name == "nt":
+    icon_path = "assets/icon.ico"
+elif os.path.exists("assets/icon.icns") and os.path.exists("assets/icon.icns"):
+    icon_path = "assets/icon.icns"
+
+a = Analysis(
+    ["app.py"],
+    pathex=[],
+    binaries=[],
+    datas=[("static", "static")],
+    hiddenimports=[
+        "PIL",
+        "rapidfuzz",
+        "rapidfuzz.fuzz",
+        "pytesseract",
+    ],
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=["tkinter", "matplotlib", "numpy", "PyQt5", "PySide2"],
+    noarchive=False,
+    optimize=0,
+)
+
+pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+
+exe_kwargs = dict(
+    console=True,
+    name="FileReach",
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+)
+if icon_path:
+    exe_kwargs["icon"] = icon_path
+if os.name == "nt":
+    # Windows: request elevation once via the embedded application manifest.
+    exe_kwargs["uac_admin"] = True
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    **exe_kwargs,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name="FileReach",
+)
+
+
+
+=== FILE: make_icon.py ===
+"""
+Generate platform icons from assets/icon.png.
+
+  * assets/icon.ico  -> used by the Windows build (multi-size .ico)
+  * assets/icon.icns -> used by the macOS build (best-effort; needs Pillow + macOS)
+
+Run this once before `pyinstaller filereach.spec`. It is a no-op if icon.png
+is missing (the build will simply have no icon, which is fine).
+"""
+import os
+import sys
+from PIL import Image
+
+PNG = os.path.join("assets", "icon.png")
+ICO = os.path.join("assets", "icon.ico")
+ICNS = os.path.join("assets", "icon.icns")
+
+
+def main():
+    if not os.path.exists(PNG):
+        print("make_icon: assets/icon.png not found — skipping icon generation.")
+        return 0
+    img = Image.open(PNG).convert("RGBA")
+
+    # Windows .ico — multiple sizes embedded
+    try:
+        img.save(ICO, format="ICO",
+                 sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
+        print("make_icon: wrote", ICO)
+    except Exception as e:
+        print("make_icon: .ico failed:", e)
+
+    # macOS .icns (Pillow can write icns only from a 512x512+ RGBA image)
+    try:
+        big = img.resize((512, 512), Image.LANCZOS)
+        big.save(ICNS, format="ICNS")
+        print("make_icon: wrote", ICNS)
+    except Exception as e:
+        print("make_icon: .icns skipped:", e)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
+
+=== FILE: README.md ===
+# 🔎 FileReach
+
+> **Search your entire PC in milliseconds — without ever moving, copying, or deleting a file.**
+
+FileReach is a fast, strictly **read-only** local file search tool, designed for large
+drives (tested for libraries of 475 GB+). It indexes your storage once, then answers
+queries almost instantly from a calm, beautiful interface. It bundles no destructive
+operations: there is no delete, no rename, no copy. Your files are untouchable.
+
+The interface follows a warm "Linen" aesthetic — cream canvas, coral accents, the Inter
+typeface, soft shadows, and subtle 3D motion.
+
+---
+
+## 🎯 Project Goals
+
+1. **Instant search over massive local libraries.** A 475 GB+ collection should be searchable
+   in milliseconds — after a one-time index, not a full-disk scan every query.
+2. **Zero risk to user data.** Strictly read-only: never delete, never duplicate, never move.
+   The only writes the app ever makes are to its own index DB and log.
+3. **One permission, then frictionless.** A single Administrator prompt grants access to every
+   folder; the user is never re-prompted mid-search.
+4. **Smart, not just literal.** Fuzzy relevance ranking when there's no exact match; type,
+   extension, and date intelligence; OCR-driven search from photos of documents.
+5. **Beautiful and calm.** A clean, well-spaced interface (Linen design system) — no clutter,
+   no congestion.
+6. **Cross-platform & distributable.** One source tree; prebuilt binaries for Windows, macOS,
+   and Linux published to the Releases page via CI.
+
+---
+
+## ✅ The four hard rules (enforced in code)
+
+| Rule | How it's guaranteed |
+|------|---------------------|
+| **Never delete a file** | No `os.remove`, `shutil.rmtree`, or any delete call exists in the source. |
+| **Never duplicate a file** | File bytes are never copied — only metadata and (for the viewer) read-only content are read. |
+| **Read-only everywhere** | Files are opened `'rb'`/`'r'` only. The only writes are the index DB + log, stored in `%LOCALAPPDATA%\FileReach` (or `~/.filereach`). |
+| **Single permission prompt** | `run.py` elevates to Administrator **once** (source); the Windows build embeds a `requireAdministrator` manifest so the `.exe` does the same. |
+
+---
+
+## ✨ Features
+
+See **[FEATURES.md](FEATURES.md)** for a full guide (every feature, what it does, how to use it). Quick overview:
+
+- **Paste several names at once** (one per line or comma-separated). Results are
+  relevance-ranked; when there's no exact match, the **most related** files appear with a
+  `% related` badge (fuzzy matching via `rapidfuzz`, stdlib `difflib` fallback).
+- **Search by extension** (`.mp4`, `.pdf`, `.psd`…) and instantly get:
+  - exact **count**
+  - **total size** (auto-scaled B → KB → MB → GB → TB → PB)
+  - **first** and **last** file of that type created on the PC
+- **Search by category** — one click: Images, Videos, Audio, Documents, Code, Archives.
+- **Scope to a folder** — browse drives/directories and search only inside one.
+- **Sort** — best match, A→Z / Z→A, newest/oldest modified or created, largest/smallest.
+- **Every result shows** name, full path, size, and date, plus:
+  - 📁 **reveal in File Explorer** (file selected)
+  - 📋 **copy full path**
+- **Built-in read-only viewer:**
+  - **Markdown** → rendered
+  - **HTML** → rendered live (sandboxed, scripts off) or as source
+  - **Code** (`.py .js .jsx .ts .html .css .java …`) → syntax-highlighted
+  - **Images** → displayed
+  - Navigate results with **← / →**; close with **Esc**.
+- **Paste a photo → search.** Drop/paste an image into the side panel; FileReach OCRs the
+  text and offers one-click smart searches (detected names, extensions, dates), trying name
+  + date combinations to track down renamed files.
+
+---
+
+## 🚀 Getting started
+
+### Option A — Download a prebuilt binary (no Python needed)
+
+1. Go to the **[Releases page](../../releases/latest)**.
+2. Download the build for your OS (direct links):
+   - **Windows:** [`FileReach-Windows.zip`](../../releases/latest/download/FileReach-Windows.zip)
+   - **macOS:** [`FileReach-Mac.zip`](../../releases/latest/download/FileReach-Mac.zip)
+   - **Linux:** [`FileReach-Linux.zip`](../../releases/latest/download/FileReach-Linux.zip)
+3. Unzip and run:
+   - **Windows:** double-click `FileReach.exe` (click **Yes** once on the permission prompt).
+   - **macOS:** run `./FileReach` (see note below about Gatekeeper).
+   - **Linux:** `./FileReach`
+4. Your browser opens at `http://127.0.0.1:8765`. Click **Re-index**, pick a drive, done.
+
+> **macOS note:** Builds from GitHub Actions are not code-signed/notarized, so the first run
+> needs: *System Settings → Privacy & Security → Open Anyway*. Or, from Terminal:
+> `xattr -dr com.apple.quarantine /path/to/FileReach`.
+
+### Option B — Run from source
+
+**Windows:**
+1. Install **Python 3.10+** from <https://www.python.org/downloads/>
+   (tick **"Add Python to PATH"**).
+2. **Double-click `start.bat`** → click **Yes** on the single permission prompt.
+3. First run auto-creates a private `.venv` and installs dependencies; the browser opens
+   automatically.
+
+**macOS / Linux:**
+```bash
+cd filereach
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python3 app.py
+```
+
+---
+
+## 🖼️ Enabling OCR (image → text) — optional
+
+OCR uses **Tesseract**. The app runs perfectly without it and activates automatically when
+Tesseract is detected.
+
+**One-time install (Windows):**
+1. Download the installer from
+   <https://github.com/UB-Mannheim/tesseract/wiki> (`tesseract-ocr-w64-setup-…exe`).
+2. Install with defaults (`C:\Program Files\Tesseract-OCR`).
+3. Restart FileReach. The side panel will read **"Ready — drop a photo"**.
+
+**macOS:** `brew install tesseract`
+**Linux:** `sudo apt install tesseract-ocr`
+
+---
+
+## ⚡ Performance on big drives
+
+- The first **index** walks every folder with `os.scandir` (the fastest method) and stores
+  metadata in a **SQLite (WAL)** database with indexed columns. For hundreds of GB this is
+  typically minutes to ~30 min, depending on drive speed and file count.
+- **Searches** after that are SQLite queries — effectively instant (milliseconds).
+- **Re-indexing is incremental** — only the selected root is refreshed; `INSERT OR REPLACE`
+  updates sizes/dates in place.
+- Live progress is shown in the header (`Indexing… 1,204,330 files`).
+
+---
+
+## 🏗️ Building from source
+
+### Build a standalone binary locally
+```bash
+pip install -r requirements.txt pyinstaller
+python make_icon.py            # generates assets/icon.ico (+ .icns on macOS)
+pyinstaller filereach.spec --noconfirm
+```
+Output lands in `dist/FileReach/`.
+
+### CI builds & releases
+The workflow in [`.github/workflows/build.yml`](.github/workflows/build.yml) builds all three
+platforms on every tag push (`v*`) and attaches the zips to a GitHub Release.
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0     # triggers Windows + macOS + Linux builds → Releases page
+```
+You can also run it manually from the **Actions** tab (`workflow_dispatch`) to produce
+downloadable artifacts without publishing a release.
+
+---
+
+## 🧱 Architecture
+
+```
+filereach/
+├── start.bat              # Windows one-click launcher (source)
+├── run.py                 # bootstrap: single UAC elevation + venv + deps + launch
+├── app.py                 # Flask API server; hosts the UI; frozen-aware
+├── engine.py              # read-only indexer + search engine (SQLite)
+├── filereach.spec         # PyInstaller spec (cross-platform; Windows uac_admin)
+├── make_icon.py           # generates .ico / .icns from assets/icon.png
+├── requirements.txt
+├── assets/
+│   └── icon.png           # source icon (checked in)
+├── static/
+│   └── index.html         # the Linen-style UI (single file)
+└── .github/workflows/
+    └── build.yml          # multi-platform CI build & release
+```
+
+**Data separation:** your files are never modified. FileReach's own state lives in
+`%LOCALAPPDATA%\FileReach\` (Windows) or `~/.filereach/` (macOS/Linux): the index DB and a
+small log. The server binds to `127.0.0.1` only — nothing leaves your machine.
+
+---
+
+## 🩺 Logs & troubleshooting (read the terminal)
+
+When you launch FileReach, the console prints everything you need — **no screenshots
+required**. You'll see:
+
+- A **version banner**: version, platform, Python, data folder, log path, OCR status.
+- One coloured line per action: what was searched, **how many hits**, and elapsed time.
+- `WARN` when a folder you searched isn't indexed (so you know results came from a live
+  walk), and when cross-origin requests are blocked.
+- `ERROR` with a traceback if something fails.
+
+All of it is mirrored to `%LOCALAPPDATA%\FileReach\filereach.log`
+(`~/.filereach/filereach.log`). Paste-path searches work even without an index.
+
+## 🔒 Security
+
+FileReach is local-first and read-only by construction. See the full
+**[Security Audit 2026-06-30](docs/SECURITY_AUDIT_2026-06-30.md)** for the findings,
+fixes, and residual-risk assessment. Highlights:
+
+- Binds to `127.0.0.1` only — never exposed to the network.
+- Same-Origin enforcement blocks CSRF / drive-by requests from other sites.
+- All SQL is parameterized (no injection surface); files opened `'rb'`/`'r'` only.
+- No delete / no duplicate / no move calls exist anywhere in the source.
+
+## 🤝 Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Keep the four hard rules sacred: read-only, no
+deletes, no duplicates, single permission.
+
+## 📄 License
+
+[MIT](LICENSE) — © 2026 FileReach.
+
+
+
+=== FILE: requirements.txt ===
+# FileReach dependencies
+# Core (required)
+Flask>=3.0
+Pillow>=10.0
+
+# Optional — faster fuzzy matching. If absent, FileReach falls back to difflib.
+rapidfuzz>=3.0
+
+# Optional — OCR (image -> text). Also needs the Tesseract engine installed.
+# Get it (one-time): https://github.com/UB-Mannheim/tesseract/wiki
+pytesseract>=0.3.10
+
+
+
+=== FILE: run.py ===
+"""
+FileReach bootstrap / launcher.
+
+What this does, in order:
+  1. Ensures it is running with Administrator rights (single UAC prompt).
+     This is required so the search can read every folder on the PC, including
+     system folders and other users' folders, without per-folder permission nagging.
+  2. Creates a private virtual environment (.venv) next to this script.
+  3. Installs dependencies from requirements.txt (only if missing).
+  4. Launches app.py and opens the browser.
+
+Run it with:   python run.py        (or double-click start.bat on Windows)
+"""
+
+import os
+import sys
+import subprocess
+import platform
+
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+VENV = os.path.join(HERE, ".venv")
+IS_WIN = platform.system() == "Windows"
+PY = os.path.join(VENV, "Scripts", "python.exe") if IS_WIN else os.path.join(VENV, "bin", "python")
+
+
+# --------------------------------------------------------------------------- #
+#  Step 1 — Administrator elevation (Windows only)
+# --------------------------------------------------------------------------- #
+def is_admin():
+    if not IS_WIN:
+        return True
+    try:
+        import ctypes
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        return False
+
+
+def relaunch_as_admin():
+    """Re-launch THIS script elevated. This is the ONE UAC prompt the user sees."""
+    if not IS_WIN:
+        return
+    import ctypes
+    params = " ".join(f'"{a}"' for a in sys.argv)
+    rc = ctypes.windll.shell32.ShellExecuteW(
+        None, "runas", sys.executable, f'"{os.path.abspath(__file__)}" {params}'.strip(),
+        None, 1,
+    )
+    if rc <= 32:
+        print("Administrator permission was declined. FileReach needs it to read all folders.")
+        print("Re-run and click 'Yes' on the permission prompt.")
+        input("Press Enter to exit…")
+        sys.exit(0)
+    sys.exit(0)  # the elevated copy takes over
+
+
+# --------------------------------------------------------------------------- #
+#  Step 2/3 — virtualenv + deps
+# --------------------------------------------------------------------------- #
+def ensure_venv():
+    if os.path.isfile(PY):
+        return
+    print("› Creating virtual environment…")
+    subprocess.check_call([sys.executable, "-m", "venv", VENV])
+
+
+def ensure_deps():
+    marker = os.path.join(VENV, ".deps_installed")
+    # Quick check: is flask importable?
+    probe = subprocess.run(
+        [PY, "-c", "import flask, PIL"],
+        capture_output=True,
+    )
+    if probe.returncode == 0 and os.path.isfile(marker):
+        return
+    print("› Installing dependencies (first run only)…")
+    req = os.path.join(HERE, "requirements.txt")
+    subprocess.check_call([PY, "-m", "pip", "install", "--upgrade", "pip"])
+    subprocess.check_call([PY, "-m", "pip", "install", "-r", req])
+    with open(marker, "w") as f:
+        f.write("ok")
+
+
+# --------------------------------------------------------------------------- #
+#  Step 4 — run
+# --------------------------------------------------------------------------- #
+def run():
+    os.chdir(HERE)
+    env = dict(os.environ)
+    env["PYTHONUNBUFFERED"] = "1"
+    try:
+        subprocess.check_call([PY, os.path.join(HERE, "app.py")])
+    except KeyboardInterrupt:
+        print("\nStopped.")
+
+
+def main():
+    if IS_WIN and not is_admin():
+        print("Requesting permission to access all folders (this prompt appears only once)…")
+        relaunch_as_admin()
+    print("=" * 56)
+    print("  FileReach — preparing your environment")
+    print("=" * 56)
+    ensure_venv()
+    ensure_deps()
+    print("› Launching FileReach…")
+    run()
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+=== FILE: start.bat ===
+@echo off
+REM ============================================================
+REM   FileReach — Windows one-click launcher
+REM   Double-click this file. It asks for permission ONCE,
+REM   sets up its environment, and opens the search UI.
+REM ============================================================
+SETLOCAL
+cd /d "%~dp0"
+
+REM Prefer python, fall back to py launcher
+where python >nul 2>nul
+IF %ERRORLEVEL%==0 (
+    python run.py
+) ELSE (
+    py run.py
+)
+
+REM If Python is missing, show a friendly message.
+IF %ERRORLEVEL% NEQ 0 (
+    echo.
+    echo ----------------------------------------------------------
+    echo  Python was not found on this PC.
+    echo  Install Python 3.10+ from https://www.python.org/downloads/
+    echo  (tick "Add Python to PATH" during install), then re-run.
+    echo ----------------------------------------------------------
+    pause
+)
+ENDLOCAL
+
+
